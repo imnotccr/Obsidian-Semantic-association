@@ -34,15 +34,14 @@
    - 召回与排序
    - 从相关笔记中选出“最契合的一段文字”
 
-7. `commands/`
-   - 打开视图
-   - 重建索引
-   - 暂停 / 恢复自动索引
+7. 命令注册（内联于 `main.ts`）
+   - 打开关联视图、打开语义搜索、重建索引
+   - v1 命令数量少，直接在 `main.ts` 中通过 `addCommand()` 注册
 
 8. `utils/`
-   - 文本处理
-   - 路径过滤
-   - debounce / logger 等辅助函数
+   - hash 计算（DJB2）
+   - debounce 防抖
+   - error-logger 错误日志（容量上限 + 时间过期双重清理）
 
 ---
 
@@ -87,9 +86,12 @@
 - chunk 级切分
 - note / chunk embedding
 - 最佳 passage 选取
-- 增量索引
-- 基础设置页
-- 基础命令
+- 增量索引（create / modify / delete / rename）
+- 索引持久化（index-store.json 快照，启动加载 + 增量防抖保存）
+- 错误日志系统（容量上限 + 时间过期双重清理）
+- 三种 Embedding Provider（mock / local / remote）
+- 设置页（provider 选择、API 配置、模型列表检测、测试连接、排除文件夹、索引管理）
+- 基础命令（打开关联视图、打开语义搜索、重建索引）
 
 ### v1 不做
 - 聊天功能
@@ -222,7 +224,7 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 - `lookup-view.ts`
   - 搜索视图
 - `components/`
-  - 结果列表、搜索框、空状态、状态标签
+  - v1 暂未拆分独立组件，UI 直接在 view 中构建 DOM
 
 ### `indexing/`
 - `scanner.ts`
@@ -239,6 +241,16 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
   - EmbeddingProvider 接口
 - `mock-provider.ts`
   - 开发期 mock
+- `local-provider.ts`
+  - 本地 Embedding Provider（基于 Transformers.js + ONNX Runtime）
+  - 支持 bge-small-zh-v1.5、bge-base-zh-v1.5、bge-large-zh-v1.5 等预置模型
+  - 可选量化精度（Q8/Q4/FP16/FP32）
+  - 懒加载，首次 embed 时才下载模型，后续从本地缓存加载
+- `remote-provider.ts`
+  - 远程 Embedding Provider（OpenAI 兼容 API）
+  - 支持批量请求、自动重试与指数退避（429/5xx）
+  - 动态维度检测（适配不同模型）
+  - 兼容 Azure、Together.ai、本地部署等服务
 - `embedding-service.ts`
   - provider 调度层
 
@@ -248,14 +260,23 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 - `vector-store.ts`
 
 ### `search/`
-- `similarity.ts`
-  - 余弦相似度等纯函数
 - `connections-service.ts`
-  - 当前笔记相关推荐
+  - 当前笔记相关推荐（余弦相似度内联于 `vector-store.ts` 和 `passage-selector.ts`）
 - `lookup-service.ts`
   - 搜索逻辑
 - `passage-selector.ts`
   - 从候选笔记中选最佳段落
+
+### `utils/`
+- `hash.ts`
+  - DJB2 哈希算法，用于文件内容变更检测
+- `debounce.ts`
+  - 通用防抖工具函数
+- `error-logger.ts`
+  - 索引错误日志系统
+  - 容量上限（500 条）+ 时间过期（30 天）双重清理
+  - 全量索引前自动清空
+  - 持久化到 `error-log.json`
 
 ---
 
@@ -267,8 +288,35 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 2. 简要总结当前结构
 3. 给出最小实现计划
 4. 分小步实现
-5. 说明改了哪些文件
-6. 给出手动验证步骤
+5. 如遇到实际问题/踩坑/异常，记录到 `TROUBLESHOOTING.md`
+6. 说明改了哪些文件
+7. 给出手动验证步骤
+
+### 开发问题记录策略（强制执行）
+
+本项目约定：**所有在 Obsidian 实际运行中遇到的“问题 → 根因 → 修复”都要沉淀为可检索的文档**，避免同类问题重复踩坑，并为后续迭代提供决策依据。
+
+#### 记录位置
+- 统一记录在 `TROUBLESHOOTING.md`
+
+#### 何时必须记录
+- 插件在 Obsidian 中出现报错/异常行为（尤其是“提示失败但原因不明”）
+- 修复了 bug（无论大小）
+- 遇到环境/权限/构建问题（如 node/脚本策略/打包工具异常）
+- 出现性能问题或必须做取舍的实现策略（例如需要 debounce、需要容错、需要缓存）
+- 任意“你以后大概率会忘，但再次遇到会浪费时间”的坑
+
+#### 单条记录建议包含
+- 日期
+- 现象（用户可见表现）
+- 最小复现步骤（可选但推荐）
+- 根因分析（必须：写清楚为什么）
+- 解决方式（必须：写清楚怎么改）
+- 涉及文件（便于定位）
+- 状态（已修复/待验证/已知限制/待优化）
+
+#### 与代码改动的配套原则
+- 修复完成后，确保文档与代码一致：涉及架构变更时同步更新 `ARCHITECTURE.md`；涉及用户使用方式变更时同步更新 `README.md`
 
 ### Claude 不应做的事
 - 不要一次性重写整个项目
@@ -295,11 +343,21 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 
 ## 当前优先级
 
-1. 搭建插件骨架
-2. 实现 Connections View 空壳
-3. 实现 chunker
-4. 实现 mock embeddings
-5. 实现 note-level 召回
-6. 实现 passage-selector
-7. 在右侧展示最佳 passage
-8. 再接入真实 embedding provider
+v1 核心功能已全部完成：
+
+- ~~搭建插件骨架~~ ✓
+- ~~实现 Connections View~~ ✓
+- ~~实现 chunker~~ ✓
+- ~~实现 mock embeddings~~ ✓
+- ~~实现 note-level 召回~~ ✓
+- ~~实现 passage-selector~~ ✓
+- ~~在右侧展示最佳 passage~~ ✓
+- ~~接入真实 embedding provider（local + remote）~~ ✓
+- ~~索引持久化与错误日志~~ ✓
+
+后续可选方向（v2）：
+
+1. UI/UX 优化（折叠展开、主题适配、结果分组）
+2. 性能优化（大 vault 索引速度、内存占用）
+3. 更多 embedding 模型支持
+4. 搜索结果排序策略优化

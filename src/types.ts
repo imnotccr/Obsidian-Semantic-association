@@ -8,6 +8,9 @@
 /** 向量类型：固定长度的浮点数组 */
 export type Vector = number[];
 
+/** 本地模型量化精度，对应 Transformers.js 的 ONNX 文件变体 */
+export type LocalDtype = "fp32" | "fp16" | "q8" | "q4";
+
 /**
  * Note 元数据
  * 代表 vault 中一篇 Markdown 文件的索引信息
@@ -120,6 +123,12 @@ export interface SemanticConnectionsSettings {
 	remoteModel: string;
 	/** 单次批量请求最大条数（避免超过 API 限制） */
 	remoteBatchSize: number;
+
+	// ---- Local Provider 配置 ----
+	/** 本地模型 ID（如 "Xenova/bge-base-zh-v1.5"） */
+	localModelId: string;
+	/** 本地模型量化精度（默认 q8，平衡大小与精度） */
+	localDtype: LocalDtype;
 }
 
 /**
@@ -150,6 +159,17 @@ export interface IndexSummary {
 	failed: number;
 }
 
+/**
+ * 远程 API 返回的模型信息
+ * 用于设置页的模型下拉选择框
+ */
+export interface RemoteModelInfo {
+	/** 模型 ID（如 "text-embedding-3-small"） */
+	id: string;
+	/** 模型所有者（如 "openai"、"system"） */
+	ownedBy: string;
+}
+
 /** 插件默认设置 */
 export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	maxConnections: 20,
@@ -160,4 +180,6 @@ export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	remoteApiUrl: "https://api.openai.com/v1",
 	remoteModel: "text-embedding-3-small",
 	remoteBatchSize: 100,
+	localModelId: "Xenova/bge-base-zh-v1.5",
+	localDtype: "q8",
 };

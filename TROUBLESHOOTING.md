@@ -39,16 +39,16 @@ for (let i = 0; i < files.length; i++) {
 1. `indexAll()` 添加单文件 try-catch，失败记录到 ErrorLogger，继续下一个文件
 2. `indexAll()` 返回 `IndexSummary { total, failed }` 供 UI 展示部分失败
 3. 新增 `ErrorLogger` 服务，持久化错误到 `error-log.json`
-4. Store 持久化待后续实现（标记为已知限制）
+4. 引入索引快照加载/保存，避免每次启动全量重建
 
 **涉及文件**：
 
 - `src/indexing/reindex-service.ts` — 单文件容错 + ErrorLogger 注入
 - `src/utils/error-logger.ts` — 新建
 - `src/types.ts` — 新增 `IndexErrorEntry`、`IndexSummary`
-- `src/main.ts` — 初始化 ErrorLogger，更新 rebuildIndex 逻辑
+- `src/main.ts` — 初始化 ErrorLogger，更新 rebuildIndex 和索引快照逻辑
 
-**状态**：容错和错误日志已修复。Store 持久化待实现。
+**状态**：容错和错误日志已修复。索引快照持久化已实现。
 
 ---
 
@@ -83,8 +83,56 @@ for (let i = 0; i < files.length; i++) {
 
 ---
 
+## #010 本地模型测试报错 + 缓存隔离与清理命令
+
+**日期**：2026-03-08
+
+**现象**：测试本地模型时报错 “Cannot read properties of undefined (reading 'create')”。
+
+**根因分析**：
+
+- Transformers.js 在 Electron/Node 环境下会优先选择 `onnxruntime-node`。
+- Obsidian 插件环境缺少该原生模块，导致创建 ONNX session 时对象为空。
+
+**解决方式**：
+
+1. ??? `@huggingface/transformers` ???? ORT symbol ??? `process.release.name`??? Transformers.js ? onnxruntime-web/WASM ???
+2. 版本化本地模型缓存目录，避免 Transformers.js 升级后新旧模型文件混用：
+   `models/cache-v{LOCAL_MODEL_CACHE_VERSION}-tf{TRANSFORMERS_JS_VERSION}`。
+3. 新增命令“清理旧本地模型缓存”，清除 `models/` 下除当前缓存外的旧目录/文件。
+
+**涉及文件**：
+
+- `src/embeddings/local-provider.ts` — 预加载 onnxruntime-web + 环境配置
+- `src/embeddings/embedding-service.ts` — 版本化缓存路径
+- `src/main.ts` — 新增清理缓存命令
+
+**验证步骤**：
+
+1. 设置中选择本地模型，点击“测试本地模型”，应能正常加载/推理。
+2. 首次重建索引会下载模型文件，后续应从缓存加载。
+3. 执行命令“清理旧本地模型缓存”，确认仅保留当前版本缓存目录。
+
+---
+
+
+## #011 ?????? Unsupported device: 'cpu'
+**??**?2026-03-08
+
+**??**???????????????`Unsupported device: 'cpu'. Should be one of: ...`?
+**????**?
+- ???? ORT symbol ?? onnxruntime-web??? Transformers.js ? ORT ??????????? `supportedDevices`?
+- ?? `device=cpu` ???????? Unsupported device ???
+
+**????**?
+1. ?? Transformers.js ??? ORT symbol?????? `process.release.name` ????? Web ?????? onnxruntime-web + wasm ???
+2. pipeline ???? `device: "wasm"`??????? cpu?
+
+**????**?
+- `src/embeddings/local-provider.ts` ? `importTransformersWebBackend()` + `device: "wasm"`
+---
+
+
 ## 待解决问题
 
-### Store 持久化缺失
-
-三个 Store 的 `load()`/`serialize()` 从未在 `main.ts` 中调用，导致每次启动都是空索引，必然触发全量重建。需要在 `onLayoutReady` 中加载持久化数据，在索引完成后写入磁盘。
+暂无。

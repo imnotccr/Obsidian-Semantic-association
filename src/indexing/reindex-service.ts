@@ -177,16 +177,12 @@ export class ReindexService {
 		const chunkTexts = chunks.map((c) => c.text);
 		const chunkVectors = await this.embeddingService.embedBatch(chunkTexts);
 
-		// 将生成的向量填充到对应的 chunk 对象中
-		for (let i = 0; i < chunks.length; i++) {
-			chunks[i].vector = chunkVectors[i];
-		}
-
 		// ── 步骤 6：生成 note-level embedding ──
 		// 使用 summaryText（前 500 字）生成整篇笔记的向量
 		// 这个向量用于 ConnectionsService 的第一阶段粗筛
+		let noteVector: NoteMeta["vector"] | undefined;
 		if (noteMeta.summaryText) {
-			noteMeta.vector = await this.embeddingService.embed(noteMeta.summaryText);
+			noteVector = await this.embeddingService.embed(noteMeta.summaryText);
 		}
 
 		// ── 步骤 7：写入三个 Store ──
@@ -199,15 +195,18 @@ export class ReindexService {
 		this.chunkStore.replaceByNote(file.path, chunks);
 
 		// 7c. 写入 VectorStore（note 向量 + chunk 向量）
+		// 注意：必须在新向量完全生成成功后再删除旧向量，
+		// 否则一旦 embedding 失败会导致旧索引也丢失。
+		this.vectorStore.delete(file.path);
+		this.vectorStore.deleteByPrefix(file.path + "#");
+
 		// note-level 向量：id = 笔记路径（不含 #）
-		if (noteMeta.vector) {
-			this.vectorStore.set(file.path, noteMeta.vector);
+		if (noteVector) {
+			this.vectorStore.set(file.path, noteVector);
 		}
 		// chunk-level 向量：id = chunkId（格式 path#order，含 #）
-		for (const chunk of chunks) {
-			if (chunk.vector) {
-				this.vectorStore.set(chunk.chunkId, chunk.vector);
-			}
+		for (let i = 0; i < chunks.length; i++) {
+			this.vectorStore.set(chunks[i].chunkId, chunkVectors[i]);
 		}
 	}
 
@@ -247,7 +246,19 @@ export class ReindexService {
 						this.renameFile(task.oldPath, task.path);
 						const file = this.vault.getAbstractFileByPath(task.path);
 						if (file instanceof TFile) {
-							await this.indexFile(file);
+							// rename 后必须刷新 NoteMeta：
+							// 即使内容 hash 没变，title 也可能因文件名变化而变化。
+							const existing = this.noteStore.get(file.path);
+							const content = await this.scanner.readContent(file);
+							const noteMeta = this.scanner.buildNoteMeta(file, content);
+
+							// 内容未变：只更新元数据，不重新计算 embedding（向量已在 renameFile 里迁移）
+							if (existing && existing.hash === noteMeta.hash) {
+								this.noteStore.set(noteMeta);
+							} else {
+								// 内容有变：走完整索引流程（会重建 chunk/embedding/vector）
+								await this.indexFile(file);
+							}
 						}
 					}
 					break;

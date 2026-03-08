@@ -85,7 +85,7 @@
  */
 
 import { requestUrl } from "obsidian";
-import type { Vector } from "../types";
+import type { Vector, RemoteModelInfo } from "../types";
 import type { EmbeddingProvider } from "./provider";
 
 /**
@@ -133,6 +133,26 @@ interface EmbeddingResponse {
 }
 
 /**
+ * OpenAI /models 端点响应格式
+ *
+ * 标准响应示例：
+ * ```json
+ * {
+ *   "data": [
+ *     { "id": "text-embedding-3-small", "object": "model", "owned_by": "system" }
+ *   ]
+ * }
+ * ```
+ */
+interface ModelsResponse {
+	data: Array<{
+		id: string;
+		object: string;
+		owned_by: string;
+	}>;
+}
+
+/**
  * 最大重试次数
  *
  * 3 次是一个常见的工程实践值：
@@ -156,6 +176,80 @@ export class RemoteProvider implements EmbeddingProvider {
 	readonly name = "remote";
 
 	/**
+	 * 获取远程 API 支持的 embedding 模型列表（静态方法）
+	 *
+	 * 调用 OpenAI 兼容的 GET /models 端点，返回可用模型列表。
+	 *
+	 * 为什么是静态方法？
+	 * - 只需要 apiUrl 和 apiKey，不需要完整的 RemoteProviderConfig
+	 * - 设置页在用户还未选择模型时就需要调用
+	 * - 避免创建临时 RemoteProvider 实例
+	 *
+	 * 过滤策略：
+	 * - 优先筛选模型 ID 包含 "embed" 的（覆盖 "embedding"、"embed" 等变体）
+	 * - 若过滤结果为空（兼容非标准命名的 API），返回全部模型
+	 * - 按 id 字母序排列，方便用户查找
+	 *
+	 * @param apiUrl - API Base URL（如 https://api.openai.com/v1）
+	 * @param apiKey - API Key（可为空，兼容无鉴权的本地部署）
+	 * @returns 过滤后的模型列表，按 id 字母序排列
+	 */
+	static async fetchModels(
+		apiUrl: string,
+		apiKey: string,
+	): Promise<RemoteModelInfo[]> {
+		const cleanUrl = (apiUrl || "").trim().replace(/\/+$/, "");
+		if (!cleanUrl) {
+			throw new Error("API Base URL 不能为空");
+		}
+
+		const url = `${cleanUrl}/models`;
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+		};
+		if (apiKey?.trim()) {
+			headers["Authorization"] = `Bearer ${apiKey.trim()}`;
+		}
+
+		let data: ModelsResponse;
+		try {
+			const response = await requestUrl({ url, method: "GET", headers });
+			data = response.json as ModelsResponse;
+		} catch (err) {
+			// 提取 HTTP 状态码（Obsidian requestUrl 在非 2xx 时抛出带 status 的错误）
+			const status =
+				err && typeof err === "object" && "status" in err
+					? (err as { status: number }).status
+					: undefined;
+			const statusInfo = status ? ` (HTTP ${status})` : "";
+			throw new Error(
+				`获取模型列表失败${statusInfo}：${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+
+		if (!data.data || !Array.isArray(data.data)) {
+			throw new Error("API 返回的模型列表格式异常");
+		}
+
+		// 将原始数据映射为 RemoteModelInfo
+		const allModels: RemoteModelInfo[] = data.data.map((m) => ({
+			id: m.id,
+			ownedBy: m.owned_by || "",
+		}));
+
+		// 过滤 embedding 模型：ID 包含 "embed" 关键词
+		const embeddingModels = allModels.filter((m) =>
+			m.id.toLowerCase().includes("embed"),
+		);
+
+		// 若有 embedding 模型则只返回它们，否则返回全部（兼容非标准命名）
+		const result = embeddingModels.length > 0 ? embeddingModels : allModels;
+
+		// 按 id 字母序排列
+		return result.sort((a, b) => a.id.localeCompare(b.id));
+	}
+
+	/**
 	 * 向量维度（动态检测）
 	 *
 	 * 初始值 1536 是 text-embedding-3-small 的默认维度。
@@ -169,12 +263,18 @@ export class RemoteProvider implements EmbeddingProvider {
 
 	/**
 	 * @param config - 远程 API 配置
-	 * @throws 如果 apiKey 为空则抛出错误（没有 Key 无法调用 API）
 	 */
 	constructor(private config: RemoteProviderConfig) {
-		if (!config.apiKey) {
-			throw new Error("Remote Embedding Provider: API Key is required");
-		}
+		// 归一化配置：防止用户输入尾部斜杠或空白导致 URL 拼接异常
+		this.config = {
+			...config,
+			apiKey: (config.apiKey || "").trim(),
+			apiUrl: (config.apiUrl || "").trim().replace(/\/+$/, ""),
+			model: (config.model || "").trim(),
+			batchSize: Number.isFinite(config.batchSize)
+				? Math.max(1, Math.floor(config.batchSize))
+				: 20,
+		};
 	}
 
 	get dimension(): number {
@@ -225,7 +325,7 @@ export class RemoteProvider implements EmbeddingProvider {
 	async embedBatch(texts: string[]): Promise<Vector[]> {
 		if (texts.length === 0) return [];
 
-		const batchSize = this.config.batchSize;
+		const batchSize = Math.max(1, this.config.batchSize);
 		const allResults: Vector[] = new Array(texts.length);
 
 		// 按 batchSize 分片，逐批请求
@@ -269,6 +369,13 @@ export class RemoteProvider implements EmbeddingProvider {
 	 * @throws 重试耗尽或遇到不可重试错误时抛出
 	 */
 	private async callApi(inputs: string[]): Promise<Vector[]> {
+		if (!this.config.apiUrl) {
+			throw new Error("Remote Embedding Provider: API Base URL is required");
+		}
+		if (!this.config.model) {
+			throw new Error("Remote Embedding Provider: model is required");
+		}
+
 		// 预处理：清理空文本
 		// OpenAI API 不接受空字符串作为输入，会返回 400 错误。
 		// 将空文本替换为单个空格，生成的向量虽然无意义，但不会中断流程。
@@ -290,13 +397,18 @@ export class RemoteProvider implements EmbeddingProvider {
 			try {
 				// 使用 Obsidian 的 requestUrl 发送请求
 				// 它基于 Node.js http 模块，不受浏览器 CORS 限制
+				const headers: Record<string, string> = {
+					"Content-Type": "application/json",
+				};
+				// API Key 允许为空：某些本地/内网部署可能不需要鉴权
+				if (this.config.apiKey) {
+					headers["Authorization"] = `Bearer ${this.config.apiKey}`;
+				}
+
 				const response = await requestUrl({
 					url,
 					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						"Authorization": `Bearer ${this.config.apiKey}`,
-					},
+					headers,
 					body: JSON.stringify(body),
 				});
 

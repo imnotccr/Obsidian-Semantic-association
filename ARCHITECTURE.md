@@ -29,6 +29,7 @@
 │            Embedding Layer（向量层）          │
 │   EmbeddingService → 统一调用入口            │
 │   MockProvider     → 开发测试用伪向量        │
+│   LocalProvider    → 本地 Transformers.js    │
 │   RemoteProvider   → OpenAI 兼容 API         │
 ├──────────────────────────────────────────────┤
 │             Storage Layer（存储层）           │
@@ -94,7 +95,7 @@ onload()
  │     ├─ ErrorLogger（错误日志，持久化到 error-log.json）
  │     ├─ NoteStore / ChunkStore / VectorStore
  │     ├─ Scanner / Chunker
- │     ├─ EmbeddingService → 根据设置选 MockProvider 或 RemoteProvider
+ │     ├─ EmbeddingService → 根据设置选 MockProvider / LocalProvider / RemoteProvider
  │     ├─ ReindexService（串联 Scanner→Chunker→Embedding→Storage + ErrorLogger）
  │     ├─ ReindexQueue（设置执行器为 ReindexService.processTask）
  │     ├─ ConnectionsService
@@ -122,7 +123,11 @@ onload()
 触发时机：首次加载 / 用户手动执行「重建索引」命令
 
 ```
-ReindexService.indexAll()
+rebuildIndex()
+ │
+ ├─ errorLogger.clear()        清空旧错误日志（日志只保留本次结果）
+ │
+ └─ ReindexService.indexAll()
  │
  └─ 对每个 .md 文件执行 indexFile()（单文件容错：失败不中断）：
      │
@@ -232,6 +237,30 @@ ReindexService.indexAll()
 
 用字符频率统计生成 128 维伪向量。同一文本永远产生相同向量，相似文本有接近的字符分布。不是真正的语义理解，但够跑通全流程。
 
+### LocalProvider（本地推理）
+
+使用 Transformers.js（@huggingface/transformers）+ ONNX Runtime Web 在本地运行 Embedding 模型：
+
+```
+特性：
+├─ 基于 WASM 后端在 Electron 中运行 ONNX 模型
+├─ 懒初始化：首次 embed() 调用时才加载模型
+├─ 模型文件缓存在插件数据目录（.obsidian/plugins/.../models/）
+├─ 首次使用需从 HuggingFace Hub 下载模型（约 80-200MB）
+├─ 支持下载进度回调（通过 Notice 展示进度）
+└─ 完全离线运行，无 API 费用
+```
+
+预置模型（大小以默认 Q8 量化为准）：
+
+| 模型 ID | 维度 | Q8 大小 | 适用场景 |
+|---------|------|---------|----------|
+| Xenova/bge-small-zh-v1.5 | 512 | ~24MB | 中文轻量，速度快 |
+| Xenova/bge-base-zh-v1.5 | 768 | ~102MB | 中文优化，推荐 |
+| Xenova/bge-large-zh-v1.5 | 1024 | ~326MB | 中文高精度，模型较大 |
+
+用户可在设置页选择量化精度（Q8/Q4/FP16/FP32），默认 Q8（最佳的大小与精度平衡）。
+
 ### RemoteProvider（生产使用）
 
 调用 OpenAI 兼容的 `/v1/embeddings` 接口：
@@ -241,10 +270,25 @@ ReindexService.indexAll()
 ├─ 按 batchSize 分片请求（默认 100 条/次）
 ├─ 429（rate limit）/ 5xx 自动退避重试（最多 3 次）
 ├─ 使用 Obsidian 的 requestUrl（绕过 CORS 限制）
-└─ 可配置 Base URL（支持 OpenAI / Azure / 其他兼容服务）
+├─ 可配置 Base URL（支持 OpenAI / Azure / 其他兼容服务）
+└─ 支持通过 GET /models 自动检测可用的 embedding 模型
 ```
 
-切换方式：在设置页选择 Provider 类型，填入 API Key 即可。
+### 模型列表检测
+
+`RemoteProvider.fetchModels()` 静态方法调用 `GET {apiUrl}/models` 端点，获取 API 支持的模型列表：
+
+```
+fetchModels(apiUrl, apiKey)
+  → GET {apiUrl}/models
+  → 过滤：保留 id 包含 "embed" 的模型
+  → 若无匹配：返回全部模型（兼容非标准命名）
+  → 按 id 字母序排列
+```
+
+设置页通过 `EmbeddingService.fetchAvailableModels()` 调用，结果缓存在 `SettingTab` 实例中。
+
+切换方式：在设置页选择 Provider 类型，从下拉列表选择模型或手动输入。
 
 ---
 
@@ -272,6 +316,7 @@ src/
 ├── embeddings/
 │   ├── provider.ts                  EmbeddingProvider 接口定义
 │   ├── mock-provider.ts             开发用字符频率伪向量
+│   ├── local-provider.ts            本地 Transformers.js（懒加载 + ONNX 推理）
 │   ├── remote-provider.ts           OpenAI 兼容 API（批量 + 重试）
 │   ├── embedding-service.ts         Provider 调度层
 │   └── index.ts
@@ -306,6 +351,7 @@ src/
 | 事件处理 | 防抖 + 去重队列 | 避免高频编辑导致频繁索引 |
 | 索引容错 | 单文件 try-catch | 单个文件失败不中断全量索引，错误记录到日志 |
 | 错误日志清理 | 启动时懒清理 + 容量上限 | 无需后台定时器，按大小和时间双重控制 |
+| 本地 embedding | Transformers.js + ONNX Runtime Web | 无 API 费用；隐私友好；模型体积可控 |
 
 ---
 
@@ -348,11 +394,12 @@ src/
 
 ### 清理策略
 
-采用**容量上限 + 时间过期**双重控制：
+采用**容量上限 + 时间过期 + 重建清空**三重控制：
 
 1. **容量上限**（500 条）：超过时自动截断最旧的条目
 2. **时间过期**（30 天）：启动时执行懒清理，删除 30 天前的条目
-3. **手动清空**：提供 `clear()` 方法供用户重置
+3. **重建清空**：每次执行「重建索引」前自动清空旧日志，确保日志只反映最近一次重建
+4. **手动清空**：提供 `clear()` 方法供用户重置
 
 ### 写入时机
 

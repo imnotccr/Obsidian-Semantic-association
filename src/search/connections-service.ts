@@ -54,7 +54,7 @@ export class ConnectionsService {
 		// 获取当前笔记的所有 chunk 向量（用于 chunk-level 比较）
 		const currentChunks = this.chunkStore.getByNote(notePath);
 		const currentChunkVectors: Vector[] = currentChunks
-			.map((c) => c.vector)
+			.map((c) => this.vectorStore.get(c.chunkId))
 			.filter((v): v is Vector => v !== undefined);
 
 		// 第二阶段：chunk-level 精排 + 选出最佳 passage

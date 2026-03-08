@@ -106,4 +106,16 @@ export interface EmbeddingProvider {
 	 * @returns 向量数组，与输入文本一一对应（顺序严格匹配）
 	 */
 	embedBatch(texts: string[]): Promise<Vector[]>;
+
+	/**
+	 * 释放 provider 持有的资源（可选）
+	 *
+	 * 使用场景：
+	 * - LocalProvider：释放 ONNX Runtime Session，回收 GPU/CPU 内存
+	 * - 在 EmbeddingService.switchProvider() 切换 provider 时调用
+	 * - 在插件卸载（onunload）时调用
+	 *
+	 * MockProvider 和 RemoteProvider 无需实现。
+	 */
+	dispose?(): Promise<void>;
 }

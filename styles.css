@@ -115,3 +115,64 @@
 	color: var(--text-normal);
 	line-height: 1.4;
 }
+
+/* ── 设置页 ── */
+
+/* 错误日志提示 */
+.sc-setting-error-hint {
+	color: var(--text-error);
+	font-size: 0.85em;
+}
+
+/* API 测试结果 */
+.sc-api-test-result {
+	margin-top: 6px;
+	padding: 4px 8px;
+	border-radius: 4px;
+	font-size: 0.85em;
+}
+
+.sc-api-test-result.is-success {
+	color: var(--text-success, #4caf50);
+	background: rgba(76, 175, 80, 0.1);
+}
+
+.sc-api-test-result.is-error {
+	color: var(--text-error);
+	background: rgba(var(--background-modifier-error-rgb), 0.1);
+}
+
+/* 模型列表加载状态提示 */
+.sc-model-fetch-hint {
+	font-size: 0.85em;
+	color: var(--text-muted);
+	margin-top: 4px;
+}
+
+.sc-model-fetch-hint.is-error {
+	color: var(--text-error);
+}
+
+/* 手动输入模型名称容器 */
+.sc-manual-model-input {
+	margin-top: 6px;
+	width: 100%;
+}
+
+/* 本地模型测试结果 */
+.sc-local-test-result {
+	margin-top: 6px;
+	padding: 4px 8px;
+	border-radius: 4px;
+	font-size: 0.85em;
+}
+
+.sc-local-test-result.is-success {
+	color: var(--text-success, #4caf50);
+	background: rgba(76, 175, 80, 0.1);
+}
+
+.sc-local-test-result.is-error {
+	color: var(--text-error);
+	background: rgba(var(--background-modifier-error-rgb), 0.1);
+}

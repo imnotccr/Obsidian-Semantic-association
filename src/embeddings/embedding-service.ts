@@ -74,11 +74,17 @@
  * 4. 切换 provider 后需要重建索引（因为新旧 provider 维度可能不同）
  */
 
-import type { Vector } from "../types";
+import type { Vector, RemoteModelInfo } from "../types";
 import type { SemanticConnectionsSettings } from "../types";
 import type { EmbeddingProvider } from "./provider";
 import { MockProvider } from "./mock-provider";
 import { RemoteProvider } from "./remote-provider";
+import { LocalProvider, SUPPORTED_LOCAL_MODELS } from "./local-provider";
+import type { LocalModelProgress } from "./local-provider";
+
+// 本地模型缓存版本：当 Transformers.js 升级或缓存结构变更时手动递增
+const LOCAL_MODEL_CACHE_VERSION = 2;
+const TRANSFORMERS_JS_VERSION = "3.8.1";
 
 export class EmbeddingService {
 	/**
@@ -89,14 +95,33 @@ export class EmbeddingService {
 	 */
 	private provider: EmbeddingProvider;
 
+	/** 插件数据目录路径（用于 LocalProvider 的模型缓存） */
+	private pluginDataPath: string;
+
+	/** 模型下载/加载进度监听器（由 main.ts 在 rebuildIndex 时设置） */
+	private progressListener?: (progress: LocalModelProgress) => void;
+
 	/**
 	 * @param settings - 插件全局设置
+	 * @param pluginDataPath - 插件数据目录的相对路径（如 ".obsidian/plugins/semantic-connections"）
 	 *
 	 * 构造时根据 settings.embeddingProvider 创建对应的 provider。
 	 * 保存 settings 引用是为了 switchProvider() 时能访问最新配置。
 	 */
-	constructor(private settings: SemanticConnectionsSettings) {
+	constructor(
+		private settings: SemanticConnectionsSettings,
+		pluginDataPath: string = "",
+	) {
+		this.pluginDataPath = pluginDataPath;
 		this.provider = this.createProvider(settings);
+	}
+
+	/** 生成本地模型缓存目录（隔离旧版本缓存，避免更新后混用） */
+	getLocalModelCachePath(): string {
+		const base = this.pluginDataPath
+			? `${this.pluginDataPath}/models`
+			: "./models";
+		return `${base}/cache-v${LOCAL_MODEL_CACHE_VERSION}-tf${TRANSFORMERS_JS_VERSION}`;
 	}
 
 	/**
@@ -157,8 +182,74 @@ export class EmbeddingService {
 	 * 需要用户手动执行「重建索引」命令来重新生成所有向量。
 	 */
 	switchProvider(settings: SemanticConnectionsSettings): void {
+		// 释放旧 provider 的资源（如 LocalProvider 的 ONNX Session）
+		if (this.provider.dispose) {
+			void this.provider.dispose();
+		}
 		this.settings = settings;
 		this.provider = this.createProvider(settings);
+	}
+
+	/**
+	 * 测试当前 provider 的连接是否正常
+	 *
+	 * 发送一条短文本进行 embed 请求，验证 API 配置（Key / URL / Model）是否有效。
+	 * - mock provider 始终成功
+	 * - remote provider 会实际调用 API
+	 *
+	 * @returns 成功时返回维度信息，失败时返回错误描述
+	 */
+	async testConnection(): Promise<{ ok: true; dimension: number } | { ok: false; error: string }> {
+		try {
+			const vec = await this.provider.embed("connection test");
+			return { ok: true, dimension: vec.length };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	/**
+	 * 获取远程 API 的可用 embedding 模型列表
+	 *
+	 * 仅在 provider 为 "remote" 且 apiUrl 已配置时有效。
+	 * 用于设置页的模型下拉选择框。
+	 *
+	 * 与 testConnection() 采用相同的 ok/error 返回模式，
+	 * 确保上层 UI 统一处理成功和失败场景。
+	 *
+	 * @returns 成功时返回模型列表，失败时返回错误信息
+	 */
+	async fetchAvailableModels(): Promise<
+		{ ok: true; models: RemoteModelInfo[] } | { ok: false; error: string }
+	> {
+		if (this.settings.embeddingProvider !== "remote") {
+			return { ok: false, error: "当前非远程模式" };
+		}
+		if (!this.settings.remoteApiUrl) {
+			return { ok: false, error: "API Base URL 未配置" };
+		}
+
+		try {
+			const models = await RemoteProvider.fetchModels(
+				this.settings.remoteApiUrl,
+				this.settings.remoteApiKey,
+			);
+			return { ok: true, models };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	/**
+	 * 设置模型下载/加载进度监听器
+	 *
+	 * 由 main.ts 在 rebuildIndex() 中使用，
+	 * 将 LocalProvider 的模型下载进度传递到 Notice。
+	 *
+	 * @param fn - 进度回调，传入 undefined 清除监听
+	 */
+	setProgressListener(fn: ((progress: LocalModelProgress) => void) | undefined): void {
+		this.progressListener = fn;
 	}
 
 	/**
@@ -171,6 +262,7 @@ export class EmbeddingService {
 	 *
 	 * 当前支持：
 	 * - "remote"：使用 OpenAI 兼容 API（生产推荐）
+	 * - "local"：使用 Transformers.js 本地推理（无 API 费用）
 	 * - "mock"：使用字符频率伪向量（开发调试用）
 	 * - default → mock：未知类型时降级到 mock，避免崩溃
 	 */
@@ -183,6 +275,18 @@ export class EmbeddingService {
 					model: settings.remoteModel,
 					batchSize: settings.remoteBatchSize,
 				});
+			case "local": {
+				const modelInfo = SUPPORTED_LOCAL_MODELS.find(
+					(m) => m.id === settings.localModelId,
+				);
+				return new LocalProvider({
+					modelId: settings.localModelId,
+					dimension: modelInfo?.dimension ?? 384,
+					cachePath: this.getLocalModelCachePath(),
+					dtype: settings.localDtype,
+					onProgress: (info) => this.progressListener?.(info),
+				});
+			}
 			case "mock":
 			default:
 				// default 降级到 mock：即使 settings 中出现未知值也不会崩溃

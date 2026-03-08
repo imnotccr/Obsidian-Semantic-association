@@ -11,6 +11,7 @@
 import { ItemView, TFile, WorkspaceLeaf } from "obsidian";
 import type SemanticConnectionsPlugin from "../main";
 import type { ConnectionResult } from "../types";
+import { debounce } from "../utils/debounce";
 
 /** 视图类型标识符 */
 export const VIEW_TYPE_CONNECTIONS = "semantic-connections-view";
@@ -19,6 +20,9 @@ export class ConnectionsView extends ItemView {
 	private plugin: SemanticConnectionsPlugin;
 	/** 防止重复渲染的标记 */
 	private currentNotePath: string = "";
+	private scheduleRefresh = debounce((force: boolean = false) => {
+		void this.refreshView(force);
+	}, 300);
 
 	constructor(leaf: WorkspaceLeaf, plugin: SemanticConnectionsPlugin) {
 		super(leaf);
@@ -45,6 +49,15 @@ export class ConnectionsView extends ItemView {
 			}),
 		);
 
+		// 当前文件内容更新时刷新结果
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (!(file instanceof TFile) || file.extension !== "md") return;
+				if (file.path !== this.currentNotePath) return;
+				this.scheduleRefresh(true);
+			}),
+		);
+
 		// 初次打开时渲染
 		this.refreshView();
 	}
@@ -57,7 +70,7 @@ export class ConnectionsView extends ItemView {
 	 * 刷新视图
 	 * 获取当前活动文件，查询关联结果并渲染
 	 */
-	private async refreshView(): Promise<void> {
+	private async refreshView(force = false): Promise<void> {
 		const file = this.app.workspace.getActiveFile();
 
 		// 无活动文件或非 md 文件
@@ -68,7 +81,7 @@ export class ConnectionsView extends ItemView {
 		}
 
 		// 避免重复查询同一文件
-		if (file.path === this.currentNotePath) return;
+		if (!force && file.path === this.currentNotePath) return;
 		this.currentNotePath = file.path;
 
 		// 检查索引状态
