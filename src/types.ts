@@ -107,6 +107,47 @@ export interface SemanticConnectionsSettings {
 	embeddingProvider: "mock" | "local" | "remote";
 	/** 自动索引是否开启 */
 	autoIndex: boolean;
+
+	// ---- Remote Provider 配置 ----
+	/** API Key（OpenAI 或兼容服务） */
+	remoteApiKey: string;
+	/**
+	 * API Base URL
+	 * 默认 OpenAI，也可配置为兼容服务（Azure、together.ai 等）
+	 */
+	remoteApiUrl: string;
+	/** Embedding 模型名称 */
+	remoteModel: string;
+	/** 单次批量请求最大条数（避免超过 API 限制） */
+	remoteBatchSize: number;
+}
+
+/**
+ * 索引错误日志条目
+ * 记录单次索引失败的详细信息，用于事后诊断
+ */
+export interface IndexErrorEntry {
+	/** 错误发生时间（ms since epoch） */
+	timestamp: number;
+	/** 失败的文件路径 */
+	filePath: string;
+	/** 错误类型分类 */
+	errorType: "embedding" | "scanning" | "chunking" | "storage" | "unknown";
+	/** 错误详细信息 */
+	message: string;
+	/** 使用的 embedding provider */
+	provider?: string;
+}
+
+/**
+ * 全量索引的执行摘要
+ * 由 ReindexService.indexAll() 返回，用于 UI 显示索引结果
+ */
+export interface IndexSummary {
+	/** 扫描到的文件总数 */
+	total: number;
+	/** 索引失败的文件数 */
+	failed: number;
 }
 
 /** 插件默认设置 */
@@ -115,4 +156,8 @@ export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	excludedFolders: [],
 	embeddingProvider: "mock",
 	autoIndex: true,
+	remoteApiKey: "",
+	remoteApiUrl: "https://api.openai.com/v1",
+	remoteModel: "text-embedding-3-small",
+	remoteBatchSize: 100,
 };

@@ -60,14 +60,71 @@ export class SettingTab extends PluginSettingTab {
 			.addDropdown((dropdown) =>
 				dropdown
 					.addOption("mock", "Mock（开发测试）")
-					.addOption("local", "本地模型")
-					.addOption("remote", "远程 API")
+					.addOption("remote", "远程 API（OpenAI 兼容）")
 					.setValue(this.plugin.settings.embeddingProvider)
 					.onChange(async (value) => {
 						this.plugin.settings.embeddingProvider = value as "mock" | "local" | "remote";
 						await this.plugin.saveSettings();
+						// 重新渲染设置页以显示/隐藏对应配置项
+						this.display();
 					})
 			);
+
+		// 仅在选择 remote 时显示 API 配置项
+		if (this.plugin.settings.embeddingProvider === "remote") {
+			new Setting(containerEl)
+				.setName("API Key")
+				.setDesc("OpenAI 或兼容服务的 API Key")
+				.addText((text) =>
+					text
+						.setPlaceholder("sk-...")
+						.setValue(this.plugin.settings.remoteApiKey)
+						.onChange(async (value) => {
+							this.plugin.settings.remoteApiKey = value.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(containerEl)
+				.setName("API Base URL")
+				.setDesc("兼容 OpenAI 格式的 API 地址（无需以 /embeddings 结尾）")
+				.addText((text) =>
+					text
+						.setPlaceholder("https://api.openai.com/v1")
+						.setValue(this.plugin.settings.remoteApiUrl)
+						.onChange(async (value) => {
+							this.plugin.settings.remoteApiUrl = value.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(containerEl)
+				.setName("模型名称")
+				.setDesc("Embedding 模型 ID")
+				.addText((text) =>
+					text
+						.setPlaceholder("text-embedding-3-small")
+						.setValue(this.plugin.settings.remoteModel)
+						.onChange(async (value) => {
+							this.plugin.settings.remoteModel = value.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(containerEl)
+				.setName("批量大小")
+				.setDesc("单次 API 请求最大文本数（建议 50-100）")
+				.addSlider((slider) =>
+					slider
+						.setLimits(10, 200, 10)
+						.setValue(this.plugin.settings.remoteBatchSize)
+						.setDynamicTooltip()
+						.onChange(async (value) => {
+							this.plugin.settings.remoteBatchSize = value;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 
 		// 排除文件夹
 		new Setting(containerEl)

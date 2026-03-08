@@ -25,6 +25,7 @@ import { ReindexQueue } from "./indexing/reindex-queue";
 import { EmbeddingService } from "./embeddings/embedding-service";
 import { ConnectionsService } from "./search/connections-service";
 import { LookupService } from "./search/lookup-service";
+import { ErrorLogger } from "./utils/error-logger";
 
 export default class SemanticConnectionsPlugin extends Plugin {
 	settings: SemanticConnectionsSettings = DEFAULT_SETTINGS;
@@ -46,6 +47,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	// 搜索层
 	connectionsService!: ConnectionsService;
 	lookupService!: LookupService;
+
+	// 错误日志
+	errorLogger!: ErrorLogger;
 
 	async onload(): Promise<void> {
 		// 加载用户设置
@@ -105,6 +109,10 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	 * 只做实例化和依赖注入，不执行任何 IO 或计算
 	 */
 	private createServices(): void {
+		// 错误日志
+		const logPath = `${this.app.vault.configDir}/plugins/semantic-connections/error-log.json`;
+		this.errorLogger = new ErrorLogger(this.app.vault.adapter, logPath);
+
 		// 存储层
 		this.noteStore = new NoteStore();
 		this.chunkStore = new ChunkStore();
@@ -113,7 +121,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		// 索引层
 		this.scanner = new Scanner(this.app.vault, this.app.metadataCache);
 		this.chunker = new Chunker();
-		this.embeddingService = new EmbeddingService(this.settings.embeddingProvider);
+		this.embeddingService = new EmbeddingService(this.settings);
 
 		this.reindexService = new ReindexService(
 			this.app.vault,
@@ -123,6 +131,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			this.noteStore,
 			this.chunkStore,
 			this.vectorStore,
+			this.errorLogger,
 		);
 
 		this.reindexQueue = new ReindexQueue();
@@ -145,10 +154,15 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	/**
 	 * layout-ready 后执行
+	 * - 加载错误日志并执行月度清理
 	 * - 注册文件变更事件
 	 * - 如果从未索引过，触发全量索引
 	 */
 	private async onLayoutReady(): Promise<void> {
+		// 加载错误日志 + 月度清理（30 天前的条目自动删除）
+		await this.errorLogger.load();
+		await this.errorLogger.cleanupIfNeeded();
+
 		// 注册文件变更事件（增量索引）
 		this.registerFileEvents();
 
@@ -227,20 +241,30 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	/**
 	 * 重建全量索引
+	 *
+	 * indexAll 返回 IndexSummary（total + failed），
+	 * 即使部分文件失败也不会中断整个流程。
 	 */
 	private async rebuildIndex(): Promise<void> {
 		const notice = new Notice("正在构建语义索引...", 0);
 
 		try {
-			await this.reindexService.indexAll(
+			const { total, failed } = await this.reindexService.indexAll(
 				this.settings.excludedFolders,
 				(done, total) => {
 					notice.setMessage(`正在构建语义索引... (${done}/${total})`);
 				},
 			);
-			notice.setMessage(`索引完成：${this.noteStore.size} 篇笔记`);
-			// 3 秒后自动关闭通知
-			setTimeout(() => notice.hide(), 3000);
+
+			if (failed > 0) {
+				notice.setMessage(
+					`索引完成：${this.noteStore.size} 篇笔记（${failed} 篇失败，详见错误日志）`,
+				);
+				setTimeout(() => notice.hide(), 5000);
+			} else {
+				notice.setMessage(`索引完成：${this.noteStore.size} 篇笔记`);
+				setTimeout(() => notice.hide(), 3000);
+			}
 		} catch (err) {
 			notice.setMessage("索引失败，请查看控制台");
 			console.error("Semantic Connections: rebuild index failed", err);

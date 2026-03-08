@@ -15,3 +15,6 @@ node_modules/
 
 # obsidian
 data.json
+
+# project docs
+Claude.md
