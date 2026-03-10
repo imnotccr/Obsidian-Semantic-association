@@ -1,7 +1,8 @@
-# build output
+# build output / local debug captures
 main.js
 *.js.map
 dist/
+debug-artifacts/
 
 # npm
 node_modules/
@@ -17,9 +18,9 @@ local.settings.json
 test-credentials.json
 *.secret.json
 
-# obsidian / local plugin settings
-# remote API Base URL / API Key saved by the plugin will stay local here
+# obsidian / local plugin settings / remote API test config
+# remote API Base URL / API Key saved by the plugin stay local here
 data.json
 
 # project docs
-Claude.md
+CLAUDE.md

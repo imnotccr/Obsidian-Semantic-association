@@ -16,6 +16,9 @@ import { ChunkStore } from "../storage/chunk-store";
 import { VectorStore } from "../storage/vector-store";
 import { PassageSelector } from "./passage-selector";
 
+const NOTE_SCORE_WEIGHT = 0.7;
+const PASSAGE_SCORE_WEIGHT = 0.3;
+
 export class ConnectionsService {
 	private passageSelector: PassageSelector;
 
@@ -35,13 +38,15 @@ export class ConnectionsService {
 	 * @returns 按相似度降序排列的 ConnectionResult 列表
 	 */
 	async findConnections(notePath: string, maxConnections: number): Promise<ConnectionResult[]> {
+		if (maxConnections <= 0) return [];
+
 		// 获取当前笔记的 note-level 向量
 		const noteVector = this.vectorStore.get(notePath);
 		if (!noteVector) return [];
 
 		// 第一阶段：note-level 召回
 		// 多取一些候选（2倍），为 chunk 精排留出空间
-		const candidateCount = maxConnections * 2;
+		const candidateCount = Math.max(maxConnections * 4, maxConnections);
 		const candidates = this.vectorStore.search(
 			noteVector,
 			candidateCount,
@@ -72,10 +77,17 @@ export class ConnectionsService {
 
 			if (!bestPassage) continue;
 
+			const noteScore = candidate.score;
+			const passageScore = bestPassage.score;
+			const finalScore =
+				noteScore * NOTE_SCORE_WEIGHT + passageScore * PASSAGE_SCORE_WEIGHT;
+
 			results.push({
 				notePath: candidate.id,
 				title: candidateMeta.title,
-				score: candidate.score,
+				score: finalScore,
+				noteScore,
+				passageScore,
 				bestPassage,
 			});
 		}

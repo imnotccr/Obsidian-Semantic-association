@@ -16,8 +16,5 @@
 		"obsidian": "latest",
 		"tslib": "^2.8.1",
 		"typescript": "5.3.3"
-	},
-	"dependencies": {
-		"@huggingface/transformers": "^3.8.1"
 	}
 }

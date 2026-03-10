@@ -178,10 +178,14 @@ export class ConnectionsView extends ItemView {
 		});
 
 		// 相似度分数
-		header.createEl("span", {
+		const scoreEl = header.createEl("span", {
 			text: `${(result.score * 100).toFixed(1)}%`,
 			cls: "sc-result-score",
 		});
+		scoreEl.setAttr(
+			"title",
+			`综合 ${(result.score * 100).toFixed(1)}% | note ${(result.noteScore * 100).toFixed(1)}% | passage ${(result.passageScore * 100).toFixed(1)}%`,
+		);
 
 		// 文件路径
 		item.createEl("div", {

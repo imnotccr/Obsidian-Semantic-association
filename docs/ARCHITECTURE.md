@@ -1,564 +1,114 @@
-# Semantic Connections 项目架构说明
+# Semantic Connections 架构说明
 
-## 一、项目是什么
+## 概览
 
-一个 Obsidian 插件，为 vault 中的 Markdown 笔记建立**语义索引**，在右侧面板展示与当前笔记最相关的内容——不只是"相关笔记"，还包括笔记中**最契合的一段文字**。同时支持自然语言语义搜索。
+当前插件只保留两种 embedding provider：
 
----
+- `remote`：通过 OpenAI 兼容的 `/v1/embeddings` 接口请求远程向量
+- `mock`：用于本地开发和调试的假向量 provider
 
-## 二、整体架构分层
+默认远程模型是 `BAAI/bge-m3`。插件内部统一处理单个 dense vector，即 `number[]`，不支持 sparse embedding、ColBERT 或 multi-vector。
 
-```
-┌──────────────────────────────────────────────┐
-│              Views Layer（UI 层）             │
-│   ConnectionsView（右侧推荐）                │
-│   LookupView（语义搜索）                     │
-│   只负责渲染和用户交互，不做任何计算          │
-├──────────────────────────────────────────────┤
-│              Search Layer（搜索层）           │
-│   ConnectionsService  → 两阶段关联检索       │
-│   LookupService       → 段落级语义搜索       │
-│   PassageSelector     → 从候选笔记选最佳段落  │
-├──────────────────────────────────────────────┤
-│             Indexing Layer（索引层）          │
-│   Scanner     → 扫描 vault、读取文件         │
-│   Chunker     → 按标题切分为语义块           │
-│   ReindexService → 编排索引流程              │
-│   ReindexQueue   → 防抖、去重、串行调度      │
-├──────────────────────────────────────────────┤
-│            Embedding Layer（向量层）          │
-│   EmbeddingService → 统一调用入口            │
-│   MockProvider     → 内部开发/兜底伪向量     │
-│   LocalProvider    → 本地 Transformers.js    │
-├──────────────────────────────────────────────┤
-│             Storage Layer（存储层）           │
-│   NoteStore   → 笔记元数据                   │
-│   ChunkStore  → 语义块元数据                 │
-│   VectorStore → 向量存储 + 余弦相似度搜索     │
-└──────────────────────────────────────────────┘
-```
+## 分层
 
-每一层只依赖下层，不反向依赖，由 `main.ts` 统一组装。
+### UI
 
----
+- `src/views/connections-view.ts`
+- `src/views/lookup-view.ts`
+- `src/settings.ts`
 
-## 三、核心数据结构
+负责视图展示、命令入口和配置编辑，不直接承担索引或检索的核心逻辑。
 
-### NoteMeta（一篇笔记）
+### Indexing
 
-```
-{
-  path: "notes/Python基础.md",    // 唯一标识
-  title: "Python基础",            // frontmatter > h1 > 文件名
-  mtime: 1709884800000,           // 最后修改时间
-  hash: "a1b2c3d4",              // 内容哈希，用于跳过未变文件
-  tags: ["python", "tutorial"],
-  outgoingLinks: ["notes/OOP.md"],
-  summaryText: "Python是一种...", // 前500字，用于生成 note-level 向量
-  vector: [0.1, 0.2, ..., 0.15]  // note-level 向量
-}
-```
+- `src/indexing/scanner.ts`
+- `src/indexing/chunker.ts`
+- `src/indexing/reindex-service.ts`
+- `src/indexing/reindex-queue.ts`
 
-### ChunkMeta（一个语义块）
+负责扫描 Markdown、切分 chunk、全量重建索引和增量更新。
 
-```
-{
-  chunkId: "notes/Python基础.md#0",  // notePath + # + 序号
-  notePath: "notes/Python基础.md",
-  heading: "基础概念",               // 该块所在标题
-  text: "Python是一种编程语言...",    // 原始文本
-  order: 0,                          // 在笔记中的顺序
-  vector: [0.05, 0.15, ..., 0.12]   // chunk-level 向量
-}
-```
+### Embeddings
 
-### VectorStore 中的存储
-
-```
-// 同一个 Map 中混合存储 note 和 chunk 向量，通过 id 格式区分：
-"notes/Python基础.md"   → note-level 向量（id 不含 #）
-"notes/Python基础.md#0" → chunk-level 向量（id 含 #）
-"notes/Python基础.md#1" → chunk-level 向量
-```
-
-`VectorStore` 在加载快照、写入向量和执行搜索前都会校验维度一致性。若快照损坏或维度不一致，系统会拒绝继续使用该快照，避免静默返回错误结果。
-
-### 索引快照落盘
-
-当前快照格式已拆成两部分：
-
-- `index-store.json`：保存 note/chunk 元数据、embedding 配置和向量二进制元信息；按多行 JSON 写入，便于人工排查。
-- `index-vectors.bin`：保存全部向量主体，格式为连续的 `float32 little-endian` 二进制数据，避免把大批向量数组直接塞进 JSON。
-- 启动时同时兼容旧版 `version: 1` 的单文件 JSON 快照；下一次保存快照或重建索引后会自动迁移成 `json+binary`。
-- 设置页“查看统计”和命令“显示索引统计”会展示 note/chunk/vector 数量、快照格式、文件体积和占比。
-
-默认文件位置：
-
-```
-{vault}/.obsidian/plugins/semantic-connections/index-store.json
-{vault}/.obsidian/plugins/semantic-connections/index-vectors.bin
-```
-
----
-
-## 四、插件启动流程
-
-```
-onload()
- │
- ├─ 1. loadSettings()         读取用户配置
- │
- ├─ 2. createServices()       创建所有服务实例（只做实例化，不做计算）
- │     ├─ ErrorLogger（错误日志，持久化到 error-log.json）
- │     ├─ RuntimeLogger（运行日志，持久化到 runtime-log.json）
- │     ├─ NoteStore / ChunkStore / VectorStore
- │     ├─ Scanner / Chunker
- │     ├─ EmbeddingService → 根据设置选 LocalProvider 或 MockProvider
- │     ├─ ReindexService（串联 Scanner→Chunker→Embedding→Storage + ErrorLogger）
- │     ├─ ReindexQueue（设置执行器为 ReindexService.processTask）
- │     ├─ ConnectionsService
- │     └─ LookupService
- │
- ├─ 3. registerView()         注册 ConnectionsView 和 LookupView
-├─ 4. addCommand()           注册 4 个命令
- ├─ 5. addSettingTab()        注册设置页
- │
-└─ 6. onLayoutReady()        Obsidian 布局就绪后：
-       ├─ runtimeLogger.load()        加载运行日志
-       ├─ runtimeLogger.cleanupIfNeeded() 开发期日志清理（删除14天前的日志）
-       ├─ logRuntimeEvent("startup-sequence-started")
-       ├─ errorLogger.load()          加载错误日志
-       ├─ errorLogger.cleanupIfNeeded() 月度清理（删除30天前的日志）
-       ├─ cleanOldLocalModelCacheSilently() 启动时静默清理旧版本本地模型缓存
-       ├─ loadIndexSnapshot()        尝试恢复上次索引快照
-       ├─ registerFileEvents()        监听 create/modify/delete/rename
-       ├─ if 从未索引 → rebuildIndex()  首次全量索引
-       └─ logRuntimeEvent("plugin-ready")
-```
-
-**关键原则**：`onload()` 保持轻量，所有重计算推迟到 `onLayoutReady` 之后。
-
----
-
-## 五、索引流程
-
-### 5.1 全量索引
-
-触发时机：首次加载 / 用户手动执行「重建索引」命令
-
-```
-rebuildIndex()
- │
- ├─ errorLogger.clear()        清空旧错误日志（日志只保留本次结果）
- │
- └─ ReindexService.indexAll()
- │
- └─ 对每个 .md 文件执行 indexFile()（单文件容错：失败不中断）：
-     │
-     ├─ 1. Scanner.readContent()       读取文件内容
-     ├─ 2. Scanner.buildNoteMeta()     构建笔记元数据
-     │      ├─ 提取 title（frontmatter > h1 > 文件名）
-     │      ├─ 提取 tags（frontmatter + 正文 #tag）
-     │      ├─ 提取 outgoingLinks（[[wikilinks]]）
-     │      ├─ 提取 summaryText（正文前500字）
-     │      └─ 计算 hash（DJB2 算法）
-     │
-     ├─ 3. Hash 检查：与已存储的 hash 比较，相同则跳过
-     │
-     ├─ 4. Chunker.chunk()             按标题切分
-     │      ├─ 去掉 frontmatter
-     │      ├─ 按 # ~ ###### 标题行分段
-     │      └─ 合并过短的段落（< 50 字符）
-     │
-     ├─ 5. EmbeddingService.embedBatch()  批量生成 chunk 向量
-     │      EmbeddingService.embed()      生成 note-level 向量
-     │
-     ├─ 6. 写入三个 Store
-     │      ├─ NoteStore.set(noteMeta)
-     │      ├─ ChunkStore.replaceByNote(chunks)
-     │      └─ VectorStore.set(id, vector)  ×(N+1)
-     │
-     └─ [异常] → ErrorLogger.log() 记录错误详情，继续下一个文件
-              → indexAll 结束后统一 ErrorLogger.save()
-              → 返回 IndexSummary { total, failed }
-```
-
-### 5.2 增量索引
-
-触发时机：用户编辑、创建、删除、重命名文件
-
-```
-用户编辑文件
-  → Obsidian 触发 vault.on('modify')
-    → main.ts 捕获事件
-      → ReindexQueue.enqueue({ type: 'modify', path })
-        → 去重：普通任务按 path 合并；rename 单独保留 oldPath → newPath 迁移信息
-          → 防抖：1000ms 内无新任务后才执行
-            → 串行执行 ReindexService.processTask()
-
-特殊处理：
-- delete → 级联删除 NoteStore + ChunkStore + VectorStore 中的数据
-- rename → 先迁移所有关联数据的 path/id，再按新路径决定是否重新索引
-```
-
-这样可以避免 `a.md -> b.md` 后又立刻 `modify(b.md)` 时，旧路径迁移信息被覆盖，造成旧索引残留。
-
----
-
-## 六、搜索流程
-
-### 6.1 Connections（右侧关联推荐）——两阶段检索
-
-当用户打开一篇笔记 A 时：
-
-```
-第一阶段：note-level 粗筛
- ├─ 取笔记 A 的 note-level 向量
- ├─ 在 VectorStore 中搜索最相似的 note 向量（排除 chunk 向量和自身）
- └─ 返回 40 个候选笔记（取 maxConnections × 2）
-
-第二阶段：chunk-level 精排（PassageSelector）
- ├─ 对每个候选笔记 B：
- │   ├─ 取 B 的所有 chunk 向量
- │   ├─ 取 A 的所有 chunk 向量
- │   ├─ 对 B 的每个 chunk，计算它与 A 所有 chunks 的最大相似度
- │   └─ 选出最大相似度最高的 chunk 作为 bestPassage
- │
- └─ 按 note-level 分数排序，取前 20 条返回
-```
-
-**为什么要两阶段？**
-
-- 只用 note-level 向量：能找到相关笔记，但不知道具体哪一段最相关
-- 只用 chunk-level 向量：搜索空间太大（每篇笔记多个 chunk），性能差
-- 两阶段：先快速缩小范围，再精细选段落，兼顾性能和精度
-
-### 6.2 Lookup（语义搜索）——直接 chunk 级检索
-
-当用户输入查询词时：
-
-```
-1. 为查询文本生成 embedding → queryVector
-
-2. 在所有 chunk 向量中搜索（过滤条件：id 包含 #）
-   └─ 返回 top 100 个最相似的 chunk
-
-3. 按笔记聚合：同一篇笔记只保留分数最高的 chunk
-
-4. 排序并取前 maxResults 条，每条包含：
-   ├─ 笔记标题
-   ├─ 相似度分数
-   └─ 最佳 passage（标题 + 文本）
-```
-
-**为什么 Lookup 不走两阶段？**
-
-因为用户查询是一段短文本，不是一篇完整笔记。没有丰富的 chunk 集合可做精排，直接在 chunk 级搜索更直接有效。
-
-### 6.3 视图异步一致性
-
-- `ConnectionsView` 会在异步查询返回时再次确认当前活动笔记是否仍然一致，不一致则丢弃结果
-- `LookupView` 会在异步搜索返回时再次确认输入框中的查询词是否仍然一致，不一致则丢弃结果
-
-这样可以避免用户快速切换笔记或连续输入时，旧请求覆盖新请求的 UI 串台问题。
-
----
-
-## 七、Embedding Provider
-
-### MockProvider（内部开发/兜底）
-
-用字符频率统计生成 128 维伪向量。同一文本永远产生相同向量，相似文本有接近的字符分布。不是真正的语义理解，但够跑通全流程。该 provider 仅保留给内部开发和异常兜底，不再在设置页中暴露。
-
-### LocalProvider（本地推理）
-
-使用 Transformers.js（@huggingface/transformers）+ ONNX Runtime Web 在本地运行 Embedding 模型：
-
-```
-特性：
-├─ 基于 WASM 后端在 Electron 中运行 ONNX 模型
-├─ 懒初始化：首次 embed() 调用时才加载模型
-├─ 模型文件缓存在插件数据目录（.obsidian/plugins/.../models/）
-├─ 缓存目录采用版本化命名：cache-v{LOCAL_MODEL_CACHE_VERSION}-tf{TRANSFORMERS_JS_VERSION}
-├─ 首次使用需从 HuggingFace Hub 下载模型（约 80-200MB）
-├─ 设置页支持“下载”“清理缓存并重下”“仅清理缓存”“测试本地模型”
-├─ “下载”只做 prepare：下载缺失文件 + 初始化会话 + 预热；“测试本地模型”才执行真实测试推理
-├─ 支持下载进度回调（Notice 和设置页状态区都会展示）
-├─ 下载状态区会区分单文件完成（done）与整体就绪（ready / warmup / success）
-├─ 设置页可开启“固定到插件目录”：开启后跳过 Web Worker 浏览器缓存，优先落盘到插件目录 `models/`
-├─ 设置页进度条只会在实际进入 download / progress / done 后推进，ready / warmup 仅更新文案
-├─ 设置页“下载”使用独立的临时 LocalProvider/worker，不与共享 provider 争用运行时或进度监听
-├─ LocalProvider 在主线程仅作为代理，运行时降级链为三级：
-│  ├─ 1. worker_threads（Node Worker）：优先使用，完全后台执行
-│  ├─ 2. globalThis.Worker / window.Worker（Web Worker）：worker_threads 不可用时自动降级，使用浏览器标准 Worker API
-│  └─ 3. inline（主线程）：前两者均不可用时的最终兜底
-├─ Web Worker 入口为 `src/workers/local-model-web-worker.ts`，构建后产物为 `local-model-web-worker.js`（IIFE 格式）
-├─ Web Worker 启动时优先把本地脚本转成 `blob:` URL，绕过 `app://obsidian.md` 对 `file://` Worker 的跨源限制
-├─ 若 Blob Worker 不可用，才回落到 `file://` URL
-├─ 若最终运行模式为 `worker` 或 `inline`，模型文件会落在 `{vault}/.obsidian/plugins/semantic-connections/models/cache-v{LOCAL_MODEL_CACHE_VERSION}-tf{TRANSFORMERS_JS_VERSION}`
-├─ Web Worker 模式下模型缓存走浏览器 Cache API（非文件系统），Transformers.js 原生支持
-├─ “仅清理缓存” / “清理缓存并重下”会同时尝试删除插件目录缓存和 `transformers-cache` 浏览器缓存
-├─ 可通过 `runtime-log.json` 中的 `local-runtime-mode-selected` 查看当前实际模式
-├─ Node Worker 入口为 `src/workers/local-model-worker.ts`，构建后产物为 `local-model-worker.js`
-├─ 插件启动时会自动清理旧版本本地模型缓存
-└─ 完全离线运行，无 API 费用
-```
-
-预置模型（大小以默认 Q8 量化为准）：
-
-| 模型 ID | 维度 | Q8 大小 | 适用场景 |
-|---------|------|---------|----------|
-| Xenova/bge-small-zh-v1.5 | 512 | ~24MB | 中文轻量，速度快 |
-| Xenova/bge-base-zh-v1.5 | 768 | ~102MB | 中文优化，推荐 |
-| Xenova/bge-large-zh-v1.5 | 1024 | ~326MB | 中文高精度，模型较大 |
-
-用户可在设置页选择量化精度（Q8/Q4/FP16/FP32），默认 Q8（最佳的大小与精度平衡）。
-
-## 八、文件清单
-
-```
-src/
-├── main.ts                          插件入口，服务组装，事件注册
-├── types.ts                         全局类型定义
-├── settings.ts                      设置页 UI
-│
-├── storage/
-│   ├── note-store.ts                笔记元数据存储
-│   ├── chunk-store.ts               语义块存储（含按笔记的反向索引）
-│   ├── vector-store.ts              向量存储 + 维度校验 + 暴力余弦搜索
-│   └── index.ts
-│
-├── indexing/
-│   ├── scanner.ts                   Vault 文件扫描 + 元数据提取
-│   ├── chunker.ts                   Markdown 按标题切分
-│   ├── reindex-service.ts           索引编排（扫描→切分→embedding→存储）
-│   ├── reindex-queue.ts             任务防抖 + 去重 + 串行调度
-│   └── index.ts
-│
-├── embeddings/
-│   ├── provider.ts                  EmbeddingProvider 接口定义
-│   ├── mock-provider.ts             内部开发用字符频率伪向量
-│   ├── local-provider.ts            本地 Transformers.js（懒加载 + ONNX 推理 + 三级降级）
-│   ├── local-model-shared.ts        本地模型共享类型（LocalModelInfo / LocalProviderConfig）
-│   ├── local-runtime.ts             本地推理核心逻辑（Worker / inline 共用）
-│   ├── local-worker-protocol.ts     Worker 消息协议（Node Worker / Web Worker 共用）
-│   ├── embedding-service.ts         Provider 调度层
-│   └── index.ts
-│
-├── search/
-│   ├── connections-service.ts       两阶段关联检索
-│   ├── lookup-service.ts            段落级语义搜索
-│   ├── passage-selector.ts          最佳段落选取
-│   └── index.ts
-│
-├── views/
-│   ├── connections-view.ts          右侧关联推荐面板
-│   └── lookup-view.ts              语义搜索面板
-│
-└── utils/
-    ├── hash.ts                      DJB2 哈希（变更检测）
-    ├── debounce.ts                  防抖工具函数
-    ├── error-logger.ts              运行时 / 索引错误日志持久化 + 月度清理
-    ├── error-utils.ts               错误诊断信息标准化
-    └── runtime-logger.ts            开发期运行日志持久化 + 开发期清理
-
-workers/（构建入口，产物在项目根目录）
-├── local-model-worker.ts            Node Worker 入口（worker_threads）→ local-model-worker.js
-└── local-model-web-worker.ts        Web Worker 入口（globalThis.Worker）→ local-model-web-worker.js (IIFE)
-```
-
----
-
-## 九、关键设计决策
-
-| 决策 | 选择 | 原因 |
-|------|------|------|
-| 向量搜索算法 | 暴力遍历 | v1 数据量（<10万向量）下够用，ANN 后续可替换 |
-| Chunk 切分规则 | 按标题 + 合并短块 | 简单、直观、保留语义边界 |
-| 变更检测方式 | DJB2 哈希 | 快速、碰撞率可接受，避免无变化时重复索引 |
-| note 向量来源 | 前 500 字摘要 | 轻量，不需要额外 summarization 模型 |
-| Lookup 搜索策略 | 直接 chunk 级 | 查询是短文本，无需 note-level 粗筛 |
-| 事件处理 | 防抖 + 去重队列 | 避免高频编辑导致频繁索引 |
-| 索引容错 | 单文件 try-catch | 单个文件失败不中断全量索引，错误记录到日志 |
-| 错误日志清理 | 启动时懒清理 + 容量上限 | 无需后台定时器，按大小和时间双重控制 |
-| 本地 embedding | Transformers.js + ONNX Runtime Web | 无 API 费用；隐私友好；模型体积可控 |
-
----
-
-## 十、错误日志机制
-
-### 存储位置
-
-```
-{vault}/.obsidian/plugins/semantic-connections/error-log.json
-```
-
-### 数据格式
-
-```json
-{
-  "version": 1,
-  "lastCleanup": 1709884800000,
-  "maxEntries": 500,
-  "entries": [
-    {
-      "timestamp": 1709884800000,
-      "filePath": "notes/broken.md",
-      "errorType": "embedding",
-      "message": "Remote Embedding API error: 401 Unauthorized",
-      "provider": "remote"
-    }
-  ]
-}
-```
-
-### 错误类型分类
-
-| errorType | 含义 | 典型场景 |
-|-----------|------|----------|
-| embedding | Embedding 调用失败 | 本地模型初始化失败、推理异常 |
-| scanning  | 文件读取 / 元数据提取失败 | 文件被锁定、编码错误 |
-| chunking  | 文本切分异常 | 特殊格式导致 Chunker 异常 |
-| storage   | 存储写入失败 | 内存不足、数据格式异常 |
-| query     | 查询执行失败 | Connections / Lookup 查询异常 |
-| runtime   | 插件运行时异常 | 启动失败、未处理异常、快照恢复失败 |
-| configuration | 配置或设置相关失败 | 设置页操作失败、配置不兼容 |
-| unknown   | 无法分类 | 其他未预期的错误 |
-
-### 清理策略
-
-采用**容量上限 + 时间过期 + 重建清空**三重控制：
-
-1. **容量上限**（500 条）：超过时自动截断最旧的条目
-2. **时间过期**（30 天）：启动时执行懒清理，删除 30 天前的条目
-3. **重建清空**：每次执行「重建索引」前自动清空旧日志，确保日志只反映最近一次重建
-4. **手动清空**：提供 `clear()` 方法供用户重置
-
-### 写入时机
-
-| 场景 | 方法 | 说明 |
-|------|------|------|
-| 全量索引 | `log()` × N → `save()` × 1 | 批量记录，结束后统一持久化 |
-| 增量索引 | `logAndSave()` | 单文件失败后即时持久化 |
-| 运行时错误 | `logRuntimeError()` → `logAndSave()` | 启动、查询、快照、缓存清理等失败即时持久化 |
-
-### 运行时覆盖范围
-
-`ErrorLogger` 现在不仅服务于 `ReindexService`，还覆盖插件运行时的关键失败路径：
-
-- `main.ts` 中的插件启动、`onLayoutReady()`、全量重建索引失败
-- 索引快照加载 / 保存失败
-- 旧本地模型缓存清理失败或部分删除失败
-- `ConnectionsView` / `LookupView` 查询失败
-- `window.error` 与 `unhandledrejection` 中可归因到本插件的异常
-- `ErrorLogger.load()` 自身失败时的自诊断记录
-
-日志条目中会尽量补充 `stage`、`details`、`provider` 等上下文，便于区分是 embedding、查询、配置还是运行时问题。
-
----
-
-## 十一、运行日志机制
-
-### 存储位置
-
-```
-{vault}/.obsidian/plugins/semantic-connections/runtime-log.json
-```
-
-### 设计目标
-
-`RuntimeLogger` 不记录失败根因，而是记录成功路径、关键运行节点和必要的回退信息，主要用于开发阶段快速回答两个问题：
-
-1. 插件是否已经正常跑到目标阶段
-2. 当前本地模型最终走的是哪条执行路径
-
-### 数据格式
-
-```json
-{
-  "version": 1,
-  "lastCleanup": 1709884800000,
-  "entries": [
-    {
-      "timestamp": 1709884800000,
-      "event": "plugin-ready",
-      "level": "info",
-      "category": "lifecycle",
-      "message": "Plugin initialized successfully.",
-      "provider": "local",
-      "details": [
-        "event=plugin-ready",
-        "provider=local",
-        "model=Xenova/bge-base-zh-v1.5",
-        "dtype=q8",
-        "indexed_notes=93"
-      ]
-    }
-  ]
-}
-```
-
-### 典型事件
-
-| event | 含义 |
-|------|------|
-| `startup-sequence-started` | `onLayoutReady()` 启动链路已进入 |
-| `plugin-ready` | 插件启动流程完成 |
-| `index-snapshot-loaded` | 快照恢复成功 |
-| `rebuild-index-started` / `rebuild-index-finished` | 全量重建开始 / 完成 |
-| `local-runtime-mode-selected` | 本地模型执行路径已确定为 `worker` / `web-worker` / `inline`，必要时会附带 worker 回退细节 |
-| `local-model-download-requested` / `local-model-download-started` / `local-model-download-first-byte` | 设置页下载按钮已触发 / 已进入下载阶段 / 已收到首个下载字节 |
-| `local-model-download-ready` / `local-model-download-warmup` | 模型文件已齐备并开始初始化 / 已进入预热 |
-| `local-model-ready` | 设置页本地模型 prepare 成功 |
-| `local-model-test-ok` | 设置页本地模型测试成功 |
-
-### 清理策略
-
-运行日志与错误日志分开清理：
-
-1. **容量上限**：最多保留 1000 条运行日志
-2. **时间过期**：启动时懒清理 14 天前的条目
-3. **不随重建索引清空**：运行日志需要保留时间顺序，用于回看成功路径和执行模式切换
-
-### 与错误日志的分工
-
-- `runtime-log.json`：回答“跑到了哪里”“最终走了哪条成功路径”
-- `error-log.json`：回答“为什么失败”“失败时具体发生了什么”
-
-### Web Worker Backend Note
-
-Inside Obsidian/Electron, `globalThis.Worker` can run on a Blob URL while still
-exposing Node-like `process` globals. The local model Web Worker therefore
-spoofs the environment only around `@huggingface/transformers` import and
-`pipeline()` initialization, so Transformers.js keeps using the browser/WASM
-backend instead of switching to the Node device list (`dml`, `cpu`).
-
----
-
-## 十二、Remote Embeddings 补充（2026-03-09）
-
-本次实现后，插件的 Embedding Provider 共有三种：
-
-- `mock`：开发与兜底用途。
-- `local`：本地 Transformers.js + ONNX Runtime Web。
-- `remote`：远程 OpenAI 兼容 embeddings API。
-
-### 1. RemoteProvider 的职责
-
-代码入口：
-
+- `src/embeddings/provider.ts`
+- `src/embeddings/mock-provider.ts`
 - `src/embeddings/remote-provider.ts`
 - `src/embeddings/embedding-service.ts`
 
-`RemoteProvider` 复用现有 `EmbeddingProvider` 接口，不改索引和检索主流程。  
-因此 `ReindexService`、`LookupService`、`ConnectionsService` 仍只依赖：
+`EmbeddingService` 是唯一入口。索引和检索主流程只依赖：
 
-- `EmbeddingService.embed()`
-- `EmbeddingService.embedBatch()`
+- `embed(text)`
+- `embedBatch(texts)`
 
-### 2. 远程接口约定
+### Storage
 
-插件侧按 OpenAI 兼容 embeddings API 实现，请求格式为：
+- `src/storage/note-store.ts`
+- `src/storage/chunk-store.ts`
+- `src/storage/vector-store.ts`
+
+索引落盘由两部分组成：
+
+- `index-store.json`
+- `index-vectors.bin`
+
+### Search
+
+- `src/search/connections-service.ts`
+- `src/search/lookup-service.ts`
+- `src/search/passage-selector.ts`
+
+## Chunking 策略
+
+### paragraph-first 切块
+
+`src/indexing/chunker.ts` 当前使用 `paragraph-first-v2` 策略：
+
+1. 先按 Markdown 标题切成 section
+2. 在切块前先剥离顶层 YAML frontmatter，避免笔记元数据污染段落语义
+3. 标题本身不进入 chunk 正文，而是作为 `heading` 元数据保留
+4. 每个 section 内再按空行优先拆成段落块
+5. 短段落会尽量和相邻段落合并，避免过碎
+6. 超长段落会继续二次分片，优先找换行、句号、逗号、空格等边界
+
+当前实现里的目标长度：
+
+- `minChunkLength = 50`
+- `maxChunkLength = 1200`
+
+这两个值是插件侧的保守保护值，用来降低远程服务因为空输入、过短碎片或超长输入而返回 `400 invalid parameter` 的概率，不是远程模型官方 token 上限。
+
+### heading 作为上下文，而不是正文污染
+
+Chunk 存储结构仍然保留：
+
+- `heading`
+- `text`
+- `order`
+
+但 embedding 时不再只传 `chunk.text`。`ReindexService` 会构造：
+
+```text
+{heading}
+
+{text}
+```
+
+如果当前 chunk 没有标题，则只传正文。这样做的目的有两个：
+
+- 展示时仍然保留原始段落文本，避免标题重复出现在 passage 正文里
+- 向量计算时能拿到标题上下文，提高段落语义对齐能力
+
+`ReindexService` 在真正发送远程请求前，还会基于这个最终字符串再做一次长度保护：
+
+- 先按实际参与 embedding 的 `heading + text` 计算可用正文长度
+- 如果加上标题上下文后仍可能超限，会把该 chunk 继续拆成更小的 chunk
+- 标题上下文本身也会做裁剪，避免超长标题把正文可用空间全部吃掉
+
+## Remote Provider
+
+### 请求格式
+
+插件按 OpenAI 兼容 embeddings API 请求远程服务：
 
 ```http
 POST {baseUrl}/v1/embeddings
@@ -573,7 +123,9 @@ Content-Type: application/json
 }
 ```
 
-响应最小要求：
+### 响应要求
+
+插件期望响应结构如下：
 
 ```json
 {
@@ -584,85 +136,167 @@ Content-Type: application/json
 }
 ```
 
-说明：
+### 输入保护
 
-- 当前仅接入 `BAAI/bge-m3` 的 dense embedding。
-- 不做 sparse embedding。
-- 不做 ColBERT / multi-vector。
-- 默认模型名为 `BAAI/bge-m3`，但设置页允许修改。
-- 虽然 `bge-m3` 的 dense 向量常见认知是 1024 维，但插件不把维度写死；以接口实际返回为准。
+进入远程 API 之前，插件会做这些保护：
 
-### 3. 批量行为
+- chunker 会先剥离 frontmatter，不把 YAML 元数据送进段落向量
+- 空 chunk 会被过滤，不会发送空字符串
+- 超长段落会在本地继续拆分
+- 即使 `chunk.text` 本身未超限，最终的 `heading + text` payload 也会再做一次长度校验和二次拆分
+- 空批次不会触发 `embedBatch([])` 的远程请求
 
-`EmbeddingService.embedBatch()` 走 `RemoteProvider.embedBatch()`。  
-Remote provider 会按照设置中的 `remoteBatchSize` 对输入分批请求远端接口。
+### 端到端链路
 
-这意味着：
+一次完整的远程 embeddings 索引链路如下：
 
-- 单条 embedding 和批量 embedding 都可用。
-- 远程 provider 不依赖本地模型缓存。
-- `forcePluginLocalModelStorage` 仅影响 `local` provider，不影响 `remote`。
+1. `Scanner` 读取 Markdown，提取 `summaryText`、标题、tags、frontmatter 等元数据
+2. `Chunker` 先去掉顶层 frontmatter，再按标题切 section，按段落优先切 chunk
+3. `ReindexService` 为每个 chunk 构造最终 embedding 文本，也就是 `heading + text`
+4. 如果最终 payload 为空、超长，或需要继续拆分，会先在本地处理；本地无法修复时直接抛出索引层错误码
+5. `EmbeddingService` 把请求转给 `RemoteProvider`
+6. `RemoteProvider` 把 `input[]` 发到 `{baseUrl}/v1/embeddings`
+7. 收到响应后，先校验 HTTP 状态、JSON 结构、`data[]` 数量、向量维度
+8. `ReindexService` 再校验“返回向量数”是否和“发送的 chunk 数”一致，最后才写入 note/chunk store
 
-### 4. 设置页新增项
+这也解释了一个常见现象：目录扫描和切块都完成后，错误才出现。因为真正的远程调用发生在扫描之后，问题往往出在“最终 payload 校验”或“远程 embeddings 请求/响应”阶段，而不是目录遍历阶段。
 
-当 provider 选择为 `remote` 时，设置页会显示：
+### 错误诊断
 
-- `API Base URL`
-- `API Key`
-- `Remote Model`
-- `Timeout`
-- `Batch Size`
-- `Test Connection`
+远程 API 或索引流程失败时，错误日志会尽量保留这些字段：
 
-其中 `Test Connection` 会真实发送一次 embeddings 请求，而不是只做本地格式校验。
+- `errorCode`
+- `stage`
+- `details`
 
-### 5. 索引与快照兼容性
+`details` 中常见附加信息包括：
 
-provider 从 `local/mock` 切到 `remote` 时，行为与原有 provider 切换保持一致：
+- `status=400`
+- `input_count=16`
+- `index_mode=full`
+- `index_mode=incremental`
+- `task_type=modify`
+- `old_path=...`
 
-- 清空现有索引数据
-- 提示用户手动执行“重建索引”
+这样可以直接区分是 provider 配置问题、请求发送问题、响应结构问题，还是某次全量/增量索引触发的输入异常。
 
-索引快照元数据现在至少记录：
+与 paragraph-first / 最终 payload 保护相关的本地错误码包括：
+
+- `ERR_INDEX_CHUNK_TEXT_LIMIT_INVALID`
+  含义：根据 `heading + text` 计算出的正文可用长度不合法
+- `ERR_INDEX_CHUNK_SPLIT_STALLED`
+  含义：二次拆分时未能继续推进，通常表示拆分逻辑进入异常状态
+- `ERR_INDEX_CHUNK_SPLIT_EMPTY`
+  含义：非空 chunk 在二次拆分后没有产出有效分片
+- `ERR_INDEX_CHUNK_PAYLOAD_EMPTY`
+  含义：最终参与 embedding 的 payload 为空
+- `ERR_INDEX_CHUNK_PAYLOAD_TOO_LONG`
+  含义：最终的 `heading + text` 仍然超过本地长度保护上限
+- `ERR_INDEX_CHUNK_EMBED_REQUEST`
+  含义：chunk embedding 请求失败，但底层 provider 没有给出更具体的错误码
+- `ERR_INDEX_CHUNK_VECTOR_COUNT_MISMATCH`
+  含义：provider 返回的向量数量和 chunk 输入数量不一致
+- `ERR_INDEX_NOTE_EMBED_REQUEST`
+  含义：note summary embedding 请求失败，但底层 provider 没有给出更具体的错误码
+
+排查时建议先看 `stage`，因为它比 message 更稳定：
+
+- `provider-config`
+  说明：Base URL、API Key、Model、Timeout、Batch Size 这类配置本身就无效
+- `request-send` / `request-timeout`
+  说明：请求未成功发出，通常是网络、超时或运行环境问题
+- `response-status`
+  说明：服务端已经响应，但返回了 4xx / 5xx
+- `response-json` / `response-data` / `response-embedding` / `response-dimension`
+  说明：服务端响应结构和插件预期不兼容
+- `chunk-embedding-limit` / `chunk-embedding-split` / `chunk-embedding-validate`
+  说明：问题出在本地切块、最终 payload 长度保护或二次拆分
+- `chunk-embedding-request` / `chunk-embedding-response`
+  说明：chunk 批量请求阶段失败，或返回数量和输入数量不一致
+- `note-embedding-request`
+  说明：note summary 的单条 embedding 请求失败
+
+## 索引流程
+
+### 启动阶段
+
+`src/main.ts` 的启动顺序：
+
+1. `loadSettings()`
+2. `createServices()`
+3. 注册 views / commands / setting tab
+4. `onLayoutReady()`
+
+### layout-ready
+
+`onLayoutReady()` 负责：
+
+1. 加载运行日志和错误日志
+2. 尝试恢复索引快照
+3. 注册文件事件
+4. 自动打开 Connections View
+5. 在索引为空且配置完整时触发全量重建
+
+### 全量重建
+
+`rebuildIndex()` 负责：
+
+1. 清空旧错误日志
+2. 清空内存索引
+3. 调用 `ReindexService.indexAll(...)`
+4. 保存索引快照
+5. 更新 UI 进度和运行日志
+
+## Connections 检索流程
+
+`ConnectionsService` 当前使用“两阶段 + 混合分”流程：
+
+1. 先用 note-level vector 做粗召回
+2. 候选数按 `maxConnections * 4` 放大，给 rerank 留空间
+3. `PassageSelector` 在候选笔记里找最相关的段落
+4. 最终分数使用 note-level 和 passage-level 混合：
+
+```text
+finalScore = noteScore * 0.7 + passageScore * 0.3
+```
+
+`ConnectionResult` 里会同时保留：
+
+- `score`：最终混合分
+- `noteScore`：整篇笔记相似度
+- `passageScore`：最佳段落相似度
+
+Connections View 仍显示 `score`，但 hover 会显示三个分数，便于排查排序结果。
+
+## 索引快照兼容
+
+当前索引快照版本为 `3`，除了 embedding 配置外，还会记录：
+
+- `chunkingStrategy = "paragraph-first-v2"`
+
+加载快照时，如果发现以下任一项不兼容，会跳过加载并要求用户重建索引：
 
 - `embeddingProvider`
-- `embeddingDimension`
-- `remoteModel`
-
-当前实现还额外记录了：
-
 - `remoteBaseUrl`
+- `remoteModel`
+- `embeddingDimension`
+- `chunkingStrategy`
 
-快照恢复时会检查以下兼容性：
+这意味着旧的标题优先切块快照不会继续被复用，避免“切块逻辑已经升级，但磁盘还是旧 chunk”这种错配。
 
-- provider 是否一致
-- `local` provider 下的 `localModelId` / `localDtype`
-- `remote` provider 下的 `remoteModel` / `remoteBaseUrl`
-- 已知维度是否一致
+## 本地配置与入库约束
 
-任一不兼容时，插件会拒绝加载旧快照并提示手动重建索引。
+用于本地测试的远程配置保存在 `data.json`。该文件以及 `debug-artifacts/` 都已经被 `.gitignore` 忽略，不应提交到仓库。
 
-### 6. 启动阶段保护
+## 构建
 
-如果当前 provider 是 `remote`，且索引为空，但 `remoteBaseUrl` 或 `remoteApiKey` 尚未配置：
+```bash
+npm run build
+```
 
-- 插件不会自动触发全量重建
-- 会提示先补齐远程配置，再手动执行“重建索引”
+构建产物：
 
-这样可以避免启动阶段立刻打到一个无效远端接口。
-
-### 7. 远程错误处理覆盖面
-
-`RemoteProvider` 当前显式处理以下错误：
-
-- 网络错误
-- 非 2xx HTTP 响应
-- 超时
-- 响应体不是合法 JSON
-- 响应里没有 `data`
-- `data` 项里没有 `embedding`
-- 向量值不是有限数字
-- 同一批次内向量维度不一致
-- 首次建立后的后续请求维度发生漂移
-
-这些错误会继续进入现有的 `ErrorLogger` / `RuntimeLogger` 体系，不引入新的索引主流程分支。
+- `main.js`
+- `dist/main.js`
+- `dist/manifest.json`
+- `dist/styles.css`

@@ -48,7 +48,7 @@
  */
 
 import { TFile, type Vault } from "obsidian";
-import type { NoteMeta, ChunkMeta, IndexSummary, IndexErrorEntry } from "../types";
+import type { NoteMeta, ChunkMeta, IndexSummary, IndexErrorEntry, Vector } from "../types";
 import { Scanner } from "./scanner";
 import { Chunker } from "./chunker";
 import { EmbeddingService } from "../embeddings/embedding-service";
@@ -57,6 +57,25 @@ import { ChunkStore } from "../storage/chunk-store";
 import { VectorStore } from "../storage/vector-store";
 import type { IndexTask } from "./reindex-queue";
 import type { ErrorLogger } from "../utils/error-logger";
+import {
+	createErrorFromDiagnostic,
+	mergeErrorDetails,
+	normalizeErrorDiagnostic,
+} from "../utils/error-utils";
+
+const MAX_EMBEDDING_INPUT_LENGTH = 1200;
+const MIN_EMBEDDING_TEXT_LENGTH = 50;
+const MAX_HEADING_CONTEXT_LENGTH = 200;
+const SENTENCE_BOUNDARIES = ".!?;\u3002\uFF01\uFF1F\uFF1B";
+const CLAUSE_BOUNDARIES = ",:\uFF0C\u3001\uFF1A";
+const ERR_INDEX_CHUNK_TEXT_LIMIT_INVALID = "ERR_INDEX_CHUNK_TEXT_LIMIT_INVALID";
+const ERR_INDEX_CHUNK_SPLIT_STALLED = "ERR_INDEX_CHUNK_SPLIT_STALLED";
+const ERR_INDEX_CHUNK_SPLIT_EMPTY = "ERR_INDEX_CHUNK_SPLIT_EMPTY";
+const ERR_INDEX_CHUNK_PAYLOAD_EMPTY = "ERR_INDEX_CHUNK_PAYLOAD_EMPTY";
+const ERR_INDEX_CHUNK_PAYLOAD_TOO_LONG = "ERR_INDEX_CHUNK_PAYLOAD_TOO_LONG";
+const ERR_INDEX_CHUNK_EMBED_REQUEST = "ERR_INDEX_CHUNK_EMBED_REQUEST";
+const ERR_INDEX_CHUNK_VECTOR_COUNT_MISMATCH = "ERR_INDEX_CHUNK_VECTOR_COUNT_MISMATCH";
+const ERR_INDEX_NOTE_EMBED_REQUEST = "ERR_INDEX_NOTE_EMBED_REQUEST";
 
 export class ReindexService {
 	/**
@@ -115,12 +134,9 @@ export class ReindexService {
 			} catch (err) {
 				failed++;
 				// 记录到持久化错误日志
-				this.errorLogger?.log({
-					filePath: files[i].path,
-					errorType: this.classifyError(err),
-					message: err instanceof Error ? err.message : String(err),
-					provider: this.embeddingService.providerName,
-				});
+				this.errorLogger?.log(
+					this.buildErrorLogEntry(files[i].path, err, ["index_mode=full"]),
+				);
 				console.error(
 					`ReindexService: failed to index ${files[i].path}`,
 					err,
@@ -170,20 +186,61 @@ export class ReindexService {
 
 		// ── 步骤 4：切分为 chunks ──
 		// Chunker 按标题切分，返回 ChunkMeta[]（此时 vector 为空）
-		const chunks = this.chunker.chunk(file.path, content);
+		const chunks = this.normalizeChunksForEmbedding(
+			file.path,
+			this.chunker.chunk(file.path, content),
+		);
 
 		// ── 步骤 5：批量生成 chunk embedding ──
 		// 将所有 chunk 的文本提取出来，一次性发送给 EmbeddingService
 		// 批量调用比逐条调用效率高，也能保持 provider 端的统一批处理入口。
-		const chunkTexts = chunks.map((c) => c.text);
-		const chunkVectors = await this.embeddingService.embedBatch(chunkTexts);
+		const chunkTexts = chunks.map((c) => this.buildChunkEmbeddingText(c));
+		let chunkVectors: Vector[] = [];
+		if (chunkTexts.length > 0) {
+			try {
+				chunkVectors = await this.embeddingService.embedBatch(chunkTexts);
+			} catch (error) {
+				throw this.decorateDiagnosticError(error, {
+					code: ERR_INDEX_CHUNK_EMBED_REQUEST,
+					stage: "chunk-embedding-request",
+					details: [
+						`chunk_count=${chunks.length}`,
+						`input_count=${chunkTexts.length}`,
+						`max_input_length=${MAX_EMBEDDING_INPUT_LENGTH}`,
+					],
+				});
+			}
+
+			if (chunkVectors.length !== chunkTexts.length) {
+				throw this.createDiagnosticError(
+					`Chunk embedding vector count mismatch: expected ${chunkTexts.length}, got ${chunkVectors.length}.`,
+					{
+						code: ERR_INDEX_CHUNK_VECTOR_COUNT_MISMATCH,
+						stage: "chunk-embedding-response",
+						details: [
+							`chunk_count=${chunks.length}`,
+							`input_count=${chunkTexts.length}`,
+							`vector_count=${chunkVectors.length}`,
+						],
+					},
+				);
+			}
+		}
 
 		// ── 步骤 6：生成 note-level embedding ──
 		// 使用 summaryText（前 500 字）生成整篇笔记的向量
 		// 这个向量用于 ConnectionsService 的第一阶段粗筛
 		let noteVector: NoteMeta["vector"] | undefined;
 		if (noteMeta.summaryText) {
-			noteVector = await this.embeddingService.embed(noteMeta.summaryText);
+			try {
+				noteVector = await this.embeddingService.embed(noteMeta.summaryText);
+			} catch (error) {
+				throw this.decorateDiagnosticError(error, {
+					code: ERR_INDEX_NOTE_EMBED_REQUEST,
+					stage: "note-embedding-request",
+					details: [`summary_length=${noteMeta.summaryText.length}`],
+				});
+			}
 		}
 
 		// ── 步骤 7：写入三个 Store ──
@@ -268,12 +325,14 @@ export class ReindexService {
 		} catch (err) {
 			// 增量索引失败：即时持久化错误日志
 			if (this.errorLogger) {
-				await this.errorLogger.logAndSave({
-					filePath: task.path,
-					errorType: this.classifyError(err),
-					message: err instanceof Error ? err.message : String(err),
-					provider: this.embeddingService.providerName,
-				});
+				const details = [`index_mode=incremental`, `task_type=${task.type}`];
+				if (task.oldPath) {
+					details.push(`old_path=${task.oldPath}`);
+				}
+
+				await this.errorLogger.logAndSave(
+					this.buildErrorLogEntry(task.path, err, details),
+				);
 			}
 			// 重新抛出，让 ReindexQueue 的 flush 也能捕获并打印
 			throw err;
@@ -292,6 +351,267 @@ export class ReindexService {
 	 * - delete(path)：删除 note-level 向量（id = "notes/a.md"）
 	 * - deleteByPrefix(path + "#")：删除所有 chunk 向量（id = "notes/a.md#0", "#1"...）
 	 */
+	private buildErrorLogEntry(
+		filePath: string,
+		err: unknown,
+		contextDetails?: string[],
+	): Omit<IndexErrorEntry, "timestamp"> {
+		const diagnostic = normalizeErrorDiagnostic(err);
+		return {
+			filePath,
+			errorType: this.classifyError(err),
+			message: diagnostic.message,
+			provider: this.embeddingService.providerName,
+			errorName: diagnostic.name,
+			errorCode: diagnostic.code,
+			stage: diagnostic.stage,
+			stack: diagnostic.stack,
+			details: mergeErrorDetails(diagnostic.details, contextDetails),
+		};
+	}
+
+	private buildChunkEmbeddingText(chunk: ChunkMeta): string {
+		const heading = this.getHeadingContextForEmbedding(chunk.heading);
+		return heading ? `${heading}\n\n${chunk.text}` : chunk.text;
+	}
+
+	private normalizeChunksForEmbedding(notePath: string, chunks: ChunkMeta[]): ChunkMeta[] {
+		const normalizedChunks: ChunkMeta[] = [];
+
+		for (const chunk of chunks) {
+			const maxTextLength = this.getMaxChunkTextLength(chunk.heading);
+			const parts = this.splitTextForEmbedding(chunk.text, maxTextLength);
+			const sourceText = chunk.text.trim();
+			if (sourceText.length > 0 && parts.length === 0) {
+				throw this.createDiagnosticError(
+					"Chunk normalization produced no valid parts for a non-empty chunk.",
+					{
+						code: ERR_INDEX_CHUNK_SPLIT_EMPTY,
+						stage: "chunk-embedding-split",
+						details: [
+							`note_path=${notePath}`,
+							`source_chunk_id=${chunk.chunkId}`,
+							`source_order=${chunk.order}`,
+							`text_length=${sourceText.length}`,
+							`limit=${maxTextLength}`,
+						],
+					},
+				);
+			}
+
+			for (const part of parts) {
+				const text = part.trim();
+				if (!text) {
+					continue;
+				}
+
+				const order = normalizedChunks.length;
+				const normalizedChunk: ChunkMeta = {
+					...chunk,
+					chunkId: `${notePath}#${order}`,
+					order,
+					text,
+				};
+				const payload = this.buildChunkEmbeddingText(normalizedChunk);
+				if (!payload.trim()) {
+					throw this.createDiagnosticError(
+						"Chunk embedding payload is empty after normalization.",
+						{
+							code: ERR_INDEX_CHUNK_PAYLOAD_EMPTY,
+							stage: "chunk-embedding-validate",
+							details: [
+								`note_path=${notePath}`,
+								`chunk_id=${normalizedChunk.chunkId}`,
+								`order=${normalizedChunk.order}`,
+								`heading_length=${normalizedChunk.heading.trim().length}`,
+								`text_length=${normalizedChunk.text.length}`,
+							],
+						},
+					);
+				}
+				if (payload.length > MAX_EMBEDDING_INPUT_LENGTH) {
+					throw this.createDiagnosticError(
+						"Chunk embedding payload still exceeds the max length after normalization.",
+						{
+							code: ERR_INDEX_CHUNK_PAYLOAD_TOO_LONG,
+							stage: "chunk-embedding-validate",
+							details: [
+								`note_path=${notePath}`,
+								`chunk_id=${normalizedChunk.chunkId}`,
+								`order=${normalizedChunk.order}`,
+								`payload_length=${payload.length}`,
+								`max_input_length=${MAX_EMBEDDING_INPUT_LENGTH}`,
+								`heading_length=${this.getHeadingContextForEmbedding(normalizedChunk.heading).length}`,
+								`text_length=${normalizedChunk.text.length}`,
+							],
+						},
+					);
+				}
+
+				normalizedChunks.push(normalizedChunk);
+			}
+		}
+
+		return normalizedChunks;
+	}
+
+	private getHeadingContextForEmbedding(heading: string): string {
+		const trimmed = heading.trim();
+		if (!trimmed) {
+			return "";
+		}
+		if (trimmed.length <= MAX_HEADING_CONTEXT_LENGTH) {
+			return trimmed;
+		}
+		return `${trimmed.slice(0, MAX_HEADING_CONTEXT_LENGTH).trimEnd()}...`;
+	}
+
+	private getMaxChunkTextLength(heading: string): number {
+		const headingContext = this.getHeadingContextForEmbedding(heading);
+		const headingOverhead = headingContext ? headingContext.length + 2 : 0;
+		const limit = Math.max(
+			MIN_EMBEDDING_TEXT_LENGTH,
+			MAX_EMBEDDING_INPUT_LENGTH - headingOverhead,
+		);
+		if (!Number.isInteger(limit) || limit <= 0) {
+			throw this.createDiagnosticError("Chunk embedding text limit is invalid.", {
+				code: ERR_INDEX_CHUNK_TEXT_LIMIT_INVALID,
+				stage: "chunk-embedding-limit",
+				details: [
+					`heading_length=${heading.trim().length}`,
+					`heading_context_length=${headingContext.length}`,
+					`max_input_length=${MAX_EMBEDDING_INPUT_LENGTH}`,
+				],
+			});
+		}
+		return limit;
+	}
+
+	private splitTextForEmbedding(text: string, limit: number): string[] {
+		const trimmed = text.trim();
+		if (!trimmed) {
+			return [];
+		}
+		if (trimmed.length <= limit) {
+			return [trimmed];
+		}
+
+		const parts: string[] = [];
+		let remaining = trimmed;
+
+		while (remaining.length > limit) {
+			const splitPoint = this.findSplitPointForEmbedding(remaining, limit);
+			if (!Number.isInteger(splitPoint) || splitPoint <= 0 || splitPoint > remaining.length) {
+				throw this.createDiagnosticError("Chunk embedding split made no progress.", {
+					code: ERR_INDEX_CHUNK_SPLIT_STALLED,
+					stage: "chunk-embedding-split",
+					details: [`remaining_length=${remaining.length}`, `limit=${limit}`],
+				});
+			}
+			const part = remaining.slice(0, splitPoint).trim();
+
+			if (!part) {
+				parts.push(remaining.slice(0, limit).trim());
+				remaining = remaining.slice(limit).trimStart();
+				continue;
+			}
+
+			parts.push(part);
+			remaining = remaining.slice(splitPoint).trimStart();
+		}
+
+		if (remaining) {
+			parts.push(remaining);
+		}
+
+		const normalizedParts = parts.filter((part) => part.length > 0);
+		if (trimmed.length > 0 && normalizedParts.length === 0) {
+			throw this.createDiagnosticError(
+				"Chunk embedding split produced no non-empty parts.",
+				{
+					code: ERR_INDEX_CHUNK_SPLIT_EMPTY,
+					stage: "chunk-embedding-split",
+					details: [`text_length=${trimmed.length}`, `limit=${limit}`],
+				},
+			);
+		}
+		return normalizedParts;
+	}
+
+	private findSplitPointForEmbedding(text: string, limit: number): number {
+		const softFloor = Math.max(
+			MIN_EMBEDDING_TEXT_LENGTH,
+			Math.floor(limit * 0.6),
+		);
+		const preferredBoundaries = ["\n", SENTENCE_BOUNDARIES, CLAUSE_BOUNDARIES, " \t"];
+
+		for (const boundaryChars of preferredBoundaries) {
+			const splitPoint = this.findLastBoundary(text, limit, boundaryChars, softFloor);
+			if (splitPoint > 0) {
+				return splitPoint;
+			}
+		}
+
+		for (const boundaryChars of preferredBoundaries) {
+			const splitPoint = this.findLastBoundary(text, limit, boundaryChars, 0);
+			if (splitPoint > 0) {
+				return splitPoint;
+			}
+		}
+
+		return Math.min(limit, text.length);
+	}
+
+	private findLastBoundary(
+		text: string,
+		limit: number,
+		boundaryChars: string,
+		floor: number,
+	): number {
+		const start = Math.min(limit, text.length - 1);
+		for (let index = start; index >= floor; index--) {
+			if (boundaryChars.includes(text[index])) {
+				return index + 1;
+			}
+		}
+		return -1;
+	}
+
+	private decorateDiagnosticError(
+		error: unknown,
+		fallback: {
+			code: string;
+			stage: string;
+			details?: string[];
+		},
+	): Error {
+		const diagnostic = normalizeErrorDiagnostic(error);
+		return createErrorFromDiagnostic({
+			message: diagnostic.message,
+			name: diagnostic.name,
+			code: diagnostic.code ?? fallback.code,
+			stage: diagnostic.stage ?? fallback.stage,
+			stack: diagnostic.stack,
+			details: mergeErrorDetails(diagnostic.details, fallback.details),
+		});
+	}
+
+	private createDiagnosticError(
+		message: string,
+		diagnostic: {
+			code: string;
+			stage: string;
+			details?: string[];
+		},
+	): Error {
+		return createErrorFromDiagnostic({
+			message,
+			code: diagnostic.code,
+			stage: diagnostic.stage,
+			details: diagnostic.details,
+		});
+	}
+
 	private removeFile(path: string): void {
 		this.noteStore.delete(path);
 		this.chunkStore.deleteByNote(path);
@@ -327,8 +647,30 @@ export class ReindexService {
 	 * - unknown: 无法分类的错误
 	 */
 	private classifyError(err: unknown): IndexErrorEntry["errorType"] {
-		const msg = err instanceof Error ? err.message : String(err);
-		const lower = msg.toLowerCase();
+		const diagnostic = normalizeErrorDiagnostic(err);
+		const lower = diagnostic.message.toLowerCase();
+		const code = diagnostic.code?.toLowerCase() ?? "";
+		const stage = diagnostic.stage?.toLowerCase() ?? "";
+
+		if (
+			code === ERR_INDEX_CHUNK_TEXT_LIMIT_INVALID.toLowerCase() ||
+			code === ERR_INDEX_CHUNK_SPLIT_STALLED.toLowerCase() ||
+			code === ERR_INDEX_CHUNK_SPLIT_EMPTY.toLowerCase() ||
+			code === ERR_INDEX_CHUNK_PAYLOAD_EMPTY.toLowerCase() ||
+			code === ERR_INDEX_CHUNK_PAYLOAD_TOO_LONG.toLowerCase() ||
+			stage === "chunk-embedding-limit" ||
+			stage === "chunk-embedding-split" ||
+			stage === "chunk-embedding-validate"
+		) {
+			return "chunking";
+		}
+		if (
+			code === ERR_INDEX_CHUNK_EMBED_REQUEST.toLowerCase() ||
+			code === ERR_INDEX_CHUNK_VECTOR_COUNT_MISMATCH.toLowerCase() ||
+			code === ERR_INDEX_NOTE_EMBED_REQUEST.toLowerCase()
+		) {
+			return "embedding";
+		}
 
 		if (
 			lower.includes("embedding") ||

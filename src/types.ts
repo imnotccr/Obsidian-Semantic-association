@@ -33,8 +33,6 @@ export interface RuntimeLogEntry {
 	details?: string[];
 }
 
-export type LocalDtype = "fp32" | "fp16" | "q8" | "q4";
-
 export interface NoteMeta {
 	path: string;
 	title: string;
@@ -59,6 +57,8 @@ export interface ConnectionResult {
 	notePath: string;
 	title: string;
 	score: number;
+	noteScore: number;
+	passageScore: number;
 	bestPassage: PassageResult;
 }
 
@@ -79,12 +79,9 @@ export interface LookupResult {
 export interface SemanticConnectionsSettings {
 	maxConnections: number;
 	excludedFolders: string[];
-	embeddingProvider: "mock" | "local" | "remote";
+	embeddingProvider: "mock" | "remote";
 	autoIndex: boolean;
 	autoOpenConnectionsView: boolean;
-	localModelId: string;
-	localDtype: LocalDtype;
-	forcePluginLocalModelStorage: boolean;
 	remoteBaseUrl: string;
 	remoteApiKey: string;
 	remoteModel: string;
@@ -120,15 +117,7 @@ export interface IndexSummary {
 	failed: number;
 }
 
-export type RebuildIndexStage =
-	| "checking-local-model"
-	| "model-download"
-	| "model-ready"
-	| "model-warmup"
-	| "indexing"
-	| "saving"
-	| "success"
-	| "error";
+export type RebuildIndexStage = "preparing" | "indexing" | "saving" | "success" | "error";
 
 export interface RebuildIndexProgress {
 	stage: RebuildIndexStage;
@@ -163,12 +152,9 @@ export interface IndexStorageSummary {
 export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	maxConnections: 20,
 	excludedFolders: [],
-	embeddingProvider: "local",
+	embeddingProvider: "remote",
 	autoIndex: true,
 	autoOpenConnectionsView: true,
-	localModelId: "Xenova/bge-base-zh-v1.5",
-	localDtype: "q8",
-	forcePluginLocalModelStorage: false,
 	remoteBaseUrl: "",
 	remoteApiKey: "",
 	remoteModel: "BAAI/bge-m3",
