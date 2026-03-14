@@ -15,6 +15,16 @@ import { ChunkStore } from "../storage/chunk-store";
 import { VectorStore } from "../storage/vector-store";
 import { PassageSelector } from "./passage-selector";
 
+/**
+ * passage 分数聚合的 beta（LogSumExp 温度系数）。
+ *
+ * LogSumExp 聚合直觉：
+ * - beta 越大：越接近 max（只看最相关段落）
+ * - beta 越小：越接近平均（更多段落会“贡献”到笔记级分数）
+ *
+ * 本插件最终排序目前主要使用 bestPassage.score（更符合 UI 直觉），
+ * 但仍保留 passageScore 作为“透明化指标”展示给用户。
+ */
 const PASSAGE_AGGREGATION_BETA = 10;
 
 export class ConnectionsService {
@@ -223,11 +233,15 @@ export class ConnectionsService {
 	}
 
 	private getChunkCandidateCount(maxConnections: number, maxPassagesPerNote: number): number {
+		// 候选 chunk 要多取一些：因为后续会按 notePath 聚合并做二次 passage 精排。
+		// 经验值：下限 200，或者与 maxConnections/passagesPerNote 成比例。
 		const passagesPerNote = maxPassagesPerNote > 0 ? maxPassagesPerNote : 1;
 		return Math.max(200, maxConnections * passagesPerNote * 20, maxConnections * 50);
 	}
 
 	private meanVector(vectors: Vector[]): Vector | undefined {
+		// 当 note-level 向量缺失时，用当前笔记的 chunk 向量均值作为兜底查询向量。
+		// 这不是最精确的语义表示，但能在“只索引了 chunk 向量”时仍然工作。
 		if (vectors.length === 0) {
 			return undefined;
 		}
@@ -263,6 +277,8 @@ export class ConnectionsService {
 	}
 
 	private aggregatePassageScore(scores: number[]): number {
+		// 聚合多个 passage 分数（LogSumExp），并把结果裁剪到 [-1, 1]。
+		// （cosine similarity 理论范围就是 [-1, 1]）
 		if (scores.length === 0) {
 			return -Infinity;
 		}

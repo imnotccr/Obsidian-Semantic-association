@@ -1,7 +1,6 @@
 # build output / local debug captures
 main.js
 *.js.map
-dist/
 debug-artifacts/
 
 # npm

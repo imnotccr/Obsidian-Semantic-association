@@ -28,6 +28,7 @@ export class LookupService {
 		private embeddingService: EmbeddingService,
 	) {}
 
+	/** 判断路径是否属于排除目录（用于搜索结果的实时过滤）。 */
 	private isExcludedPath(path: string, excludedFolders: string[]): boolean {
 		if (excludedFolders.length === 0) {
 			return false;
@@ -67,6 +68,7 @@ export class LookupService {
 		if (rawResults.length === 0) return [];
 
 		// 实时过滤：如果结果所属笔记在 excludedFolders 中，则剔除（无需重建索引）。
+		// 这样用户只要修改“排除目录”，搜索/关联结果会立刻生效。
 		const filteredResults =
 			excludedFolders.length === 0
 				? rawResults

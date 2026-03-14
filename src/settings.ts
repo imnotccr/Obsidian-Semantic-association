@@ -1,5 +1,24 @@
 /**
- * Plugin settings UI.
+ * 插件设置页（Settings Tab）。
+ *
+ * Obsidian 会在“设置 -> 第三方插件 -> 本插件”打开时调用 `display()`。
+ * 本文件负责把所有可配置项渲染成 UI，并把用户输入安全地写回 `plugin.settings`。
+ *
+ * 代码结构（建议你按这个顺序阅读）：
+ * 1) `display()`：清空容器并依次渲染各个 section
+ * 2) `renderRemoteSettings()`：远程 embeddings 配置 + 测试连接按钮
+ * 3) `renderBehaviorSettings()`：行为设置（是否监听文件变动、是否启动自动打开视图）
+ * 4) `renderConnectionsSettings()`：关联视图展示相关（阈值、条数、段落数等）
+ * 5) `renderIndexManagement()`：索引管理（重建、查看存储统计等）
+ *
+ * 保存策略（学习时重点看 `saveSettingsOrRollback()`）：
+ * - 先更新 `plugin.settings`（内存态）
+ * - 再调用 `plugin.saveSettings()` 写入磁盘（data.json）
+ * - 如果写入失败：回滚到旧值，并用 Notice 提示用户
+ *
+ * 兼容性策略：
+ * - 像 remoteBaseUrl / remoteModel 这种会改变向量语义或维度的设置，一旦变更，旧索引快照通常不再可用；
+ *   因此会调用 `invalidateIndex()` 清空索引并提示用户重建。
  */
 
 import { App, Notice, PluginSettingTab, Setting, SliderComponent, TextComponent } from "obsidian";
@@ -10,7 +29,17 @@ import {
 } from "./types";
 import { normalizeRemoteBaseUrl } from "./embeddings/remote-provider";
 
+/**
+ * Obsidian 设置面板中的 Tab。
+ *
+ * 该类只负责两件事：
+ * 1) 渲染各种 Setting 控件（输入框、开关、滑块、按钮等）
+ * 2) 把用户输入写回 `plugin.settings` 并持久化（失败则回滚）
+ *
+ * 真正的业务逻辑（重建索引、测试连接、清空日志等）都委托给 `SemanticConnectionsPlugin` 去完成。
+ */
 export class SettingTab extends PluginSettingTab {
+	/** 主插件实例：用于读写 settings，并调用业务方法（rebuildIndex / syncNotes / ...）。 */
 	private plugin: SemanticConnectionsPlugin;
 
 	constructor(app: App, plugin: SemanticConnectionsPlugin) {
@@ -18,13 +47,22 @@ export class SettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	/**
+	 * Obsidian 在打开设置页、或你主动刷新 SettingTab 时会调用它。
+	 *
+	 * 这里选择“每次都重新渲染全部内容”：
+	 * - 状态更简单（不用维护一堆组件引用）
+	 * - 当保存失败需要回滚时，直接重新渲染即可保证 UI 与 settings 一致
+	 */
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
 
 		containerEl.createEl("h2", { text: "语义关联设置" });
+		// 1) 远程 embeddings 配置（会影响向量维度/质量，因此与索引兼容性强相关）
 		this.renderRemoteSettings(containerEl);
 
+		// 2) 排除目录：这些目录下的笔记不会被扫描/索引/检索
 		new Setting(containerEl)
 			.setName("排除文件夹")
 			.setDesc("每行填写一个文件夹路径。索引时会跳过这些文件夹。")
@@ -50,11 +88,21 @@ export class SettingTab extends PluginSettingTab {
 					}),
 			);
 
+		// 3) 行为设置：自动打开视图、是否监听文件变化（仅标记 dirty，不会自动请求 API）
 		this.renderBehaviorSettings(containerEl);
+		// 4) 关联视图相关：展示数量、阈值、每篇最多展示多少段落等
 		this.renderConnectionsSettings(containerEl);
+		// 5) 索引管理：重建索引、查看存储、失败任务重试等
 		this.renderIndexManagement(containerEl);
 	}
 
+	/**
+	 * 渲染“行为”设置 section。
+	 *
+	 * 这里的设置会影响插件在后台做什么：
+	 * - `autoOpenConnectionsView`：启动后自动打开关联视图（不抢焦点）
+	 * - `autoIndex`：监听 vault 文件变动；注意这里只是标记 dirty/outdated，不会自动调用远程 embeddings
+	 */
 	private renderBehaviorSettings(containerEl: HTMLElement): void {
 		containerEl.createEl("h3", { text: "行为" });
 
@@ -112,6 +160,16 @@ export class SettingTab extends PluginSettingTab {
 			);
 	}
 
+	/**
+	 * 渲染“远程嵌入（Remote Embeddings）”设置 section。
+	 *
+	 * 该 section 控制 `EmbeddingService` 的 remote provider：
+	 * - base URL：会被 `normalizeRemoteBaseUrl()` 归一化，最终请求 `{baseUrl}/v1/embeddings`
+	 * - API key：以 `Authorization: Bearer <key>` 形式发送
+	 * - model/timeout/batch size：控制请求参数
+	 *
+	 * 其中 baseUrl/model 的变更通常会让旧索引快照不再兼容，因此会调用 `invalidateIndex()` 清空索引并提示重建。
+	 */
 	private renderRemoteSettings(containerEl: HTMLElement): void {
 		containerEl.createEl("h3", { text: "远程嵌入" });
 
@@ -395,6 +453,14 @@ export class SettingTab extends PluginSettingTab {
 			});
 	}
 
+	/**
+	 * 渲染“关联视图”相关的展示/过滤设置。
+	 *
+	 * 这些设置不会影响向量本身，但会影响结果的筛选与 UI 展示：
+	 * - `maxConnections`：最多展示多少篇相关笔记
+	 * - `minSimilarityScore`：相似度阈值（0~1）
+	 * - `maxPassagesPerNote`：每篇笔记最多展示多少个“最相关段落”（0 表示不限制）
+	 */
 	private renderConnectionsSettings(containerEl: HTMLElement): void {
 		containerEl.createEl("h3", { text: "关联视图" });
 
@@ -503,6 +569,14 @@ export class SettingTab extends PluginSettingTab {
 			});
 	}
 
+	/**
+	 * 渲染“索引管理” section。
+	 *
+	 * 这里提供与索引生命周期相关的操作入口：
+	 * - 重建索引：调用 `plugin.rebuildIndex()`，并用 `onProgress` 更新进度条
+	 * - 存储统计：调用 `plugin.showIndexStorageSummary()` 查看快照文件占用
+	 * - 重试失败项：调用 `plugin.retryFailedIndexTasks()` 重试 failed-tasks.json 中记录的任务
+	 */
 	private renderIndexManagement(containerEl: HTMLElement): void {
 		containerEl.createEl("h2", { text: "索引管理" });
 
@@ -650,11 +724,25 @@ export class SettingTab extends PluginSettingTab {
 		rebuildDetailEl.style.display = "none";
 	}
 
+	/**
+	 * 当某些关键设置变化（例如远程 embeddings 的 baseUrl/model）导致旧索引不再兼容时调用。
+	 *
+	 * 处理方式很直接：
+	 * - 清空内存中的索引数据（store）
+	 * - 提示用户需要重建索引
+	 */
 	private invalidateIndex(message: string): void {
 		this.plugin.clearIndexData();
 		new Notice(message, 8000);
 	}
 
+	/**
+	 * 保存 settings；如果保存失败则回滚并（可选）刷新 UI。
+	 *
+	 * 为什么要回滚？
+	 * - Setting 控件通常已经把值写进了 `plugin.settings`
+	 * - 如果磁盘写入失败（权限/磁盘问题/异常），就需要把内存态恢复，避免 UI 与真实配置不一致
+	 */
 	private async saveSettingsOrRollback(
 		context: string,
 		rollback: () => void,
@@ -676,6 +764,12 @@ export class SettingTab extends PluginSettingTab {
 		}
 	}
 
+	/**
+	 * 解析一个正整数输入。
+	 *
+	 * - 非法/小于 minimum：返回 fallback
+	 * - 合法：返回解析后的整数
+	 */
 	private parsePositiveIntegerInput(
 		value: string,
 		fallback: number,
@@ -688,6 +782,11 @@ export class SettingTab extends PluginSettingTab {
 		return parsed;
 	}
 
+	/**
+	 * 解析一个范围内的小数输入（例如 0~1 的相似度阈值）。
+	 * - 非法/越界：返回 fallback
+	 * - 合法：返回解析后的 number
+	 */
 	private parseNumberInRangeInput(
 		value: string,
 		fallback: number,

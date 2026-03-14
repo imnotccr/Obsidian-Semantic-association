@@ -1,15 +1,42 @@
+/**
+ * LookupView - 右侧栏“语义搜索”视图。
+ *
+ * 用户在输入框里输入自然语言 query 后：
+ * 1) `executeSearch()` 调用 `LookupService.search(query, ...)`
+ * 2) LookupService 会把 query embed 成向量，并在 chunk 向量里做相似度检索
+ * 3) view 将结果渲染为列表（每条结果包含命中的最佳段落）
+ *
+ * 性能与一致性：
+ * - 输入事件做 debounce（避免每敲一次键就请求 embeddings API）
+ * - `searchRequestId` 解决竞态：新的搜索开始后，旧请求结果会被丢弃
+ */
 import { ItemView, WorkspaceLeaf } from "obsidian";
 import type SemanticConnectionsPlugin from "../main";
 import type { LookupResult } from "../types";
-import { debounce } from "../utils/debounce";
+import { debounce, type DebouncedFn } from "../utils/debounce";
 
+/** Obsidian 用来识别 view 的 type 字符串（注册/激活视图时使用）。 */
 export const VIEW_TYPE_LOOKUP = "semantic-connections-lookup";
 
+/**
+ * LookupView 实例对应一个 leaf（通常位于右侧栏）。
+ *
+ * 该 view 只负责 UI：
+ * - 维护输入框与结果容器
+ * - 触发查询（调用 LookupService）
+ * - 渲染结果并处理点击跳转
+ */
 export class LookupView extends ItemView {
+	/** 主插件实例：用于访问 settings、service/store，并记录日志。 */
 	private plugin: SemanticConnectionsPlugin;
+	/** 搜索输入框（onOpen 创建，onClose 置空）。 */
 	private searchInput: HTMLInputElement | null = null;
+	/** 结果容器（onOpen 创建，onClose 置空）。 */
 	private resultsContainer: HTMLElement | null = null;
+	/** 每次搜索递增，用于丢弃过期请求的结果（防竞态）。 */
 	private searchRequestId = 0;
+	/** 防抖后的 input handler：便于 onClose 时 cancel 定时器，避免 view 关闭后仍触发搜索。 */
+	private debouncedSearch: DebouncedFn<(event: Event) => void> | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: SemanticConnectionsPlugin) {
 		super(leaf);
@@ -28,6 +55,13 @@ export class LookupView extends ItemView {
 		return "search";
 	}
 
+	/**
+	 * view 打开时触发：构建输入框与结果容器，并注册事件。
+	 *
+	 * 输入框事件：
+	 * - input：debounce 后触发搜索
+	 * - Enter：立即搜索
+	 */
 	async onOpen(): Promise<void> {
 		const container = this.containerEl.children[1];
 		container.empty();
@@ -41,7 +75,10 @@ export class LookupView extends ItemView {
 			cls: "sc-search-input",
 		});
 
-		const debouncedSearch = debounce(() => this.executeSearch(), 300);
+		const debouncedSearch = debounce((_event: Event) => {
+			void this.executeSearch();
+		}, 300);
+		this.debouncedSearch = debouncedSearch;
 		this.searchInput.addEventListener("input", debouncedSearch);
 		this.searchInput.addEventListener("keydown", (event) => {
 			if (event.key === "Enter") {
@@ -54,12 +91,23 @@ export class LookupView extends ItemView {
 		});
 	}
 
+	/** view 关闭时触发：清理引用，并让未完成的搜索请求失效。 */
 	async onClose(): Promise<void> {
+		this.debouncedSearch?.cancel();
+		this.debouncedSearch = null;
 		this.searchInput = null;
 		this.resultsContainer = null;
 		this.searchRequestId++;
 	}
 
+	/**
+	 * 执行一次搜索：
+	 * - 空 query：清空结果
+	 * - 索引为空：提示用户先重建索引
+	 * - 否则：调用 LookupService.search 并渲染结果
+	 *
+	 * 注意：该方法会调用 embeddings API（为 query 生成向量），因此必须做 debounce。
+	 */
 	private async executeSearch(): Promise<void> {
 		const query = this.searchInput?.value?.trim() || "";
 		if (!this.resultsContainer) {
@@ -111,6 +159,7 @@ export class LookupView extends ItemView {
 		}
 	}
 
+	/** 判断某次搜索请求是否已过期（用于防止异步结果乱序覆盖 UI）。 */
 	private isStaleSearch(requestId: number, expectedQuery: string): boolean {
 		if (requestId !== this.searchRequestId) {
 			return true;
@@ -119,6 +168,7 @@ export class LookupView extends ItemView {
 		return currentQuery !== expectedQuery;
 	}
 
+	/** 渲染提示文案（空状态/加载中/未找到/失败等）。 */
 	private renderMessage(message: string): void {
 		if (!this.resultsContainer) {
 			return;
@@ -129,6 +179,7 @@ export class LookupView extends ItemView {
 			.createEl("p", { text: message, cls: "sc-placeholder-text" });
 	}
 
+	/** 渲染搜索结果列表。 */
 	private renderResults(results: LookupResult[]): void {
 		if (!this.resultsContainer) {
 			return;
@@ -141,6 +192,11 @@ export class LookupView extends ItemView {
 		}
 	}
 
+	/**
+	 * 渲染单条搜索结果。
+	 *
+	 * 点击标题/段落会打开目标笔记，并高亮命中 chunk 对应的行范围（ChunkMeta.range）。
+	 */
 	private renderResultItem(parent: Element, result: LookupResult): void {
 		const item = parent.createEl("div", { cls: "sc-result-item" });
 

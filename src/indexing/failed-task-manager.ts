@@ -12,13 +12,27 @@
 import type { DataAdapter } from "obsidian";
 import { normalizeErrorDiagnostic } from "../utils/error-utils";
 
+/**
+ * failed-tasks.json 中的单条失败记录。
+ *
+ * 记录的核心目的是“可重试”：
+ * - 用户可以在设置页点击“重试失败项”，把这些 path 重新加入索引队列/手动同步
+ * - 同时保留 attempts / lastErrorCode / lastErrorStage，便于判断是否一直失败、失败发生在哪个阶段
+ */
 export type FailedTaskEntry = {
+	/** 失败文件路径（vault 相对路径）。 */
 	path: string;
+	/** 已尝试次数（每次 markFailed +1）。 */
 	attempts: number;
+	/** 首次失败时间戳。 */
 	firstFailedAt: number;
+	/** 最近一次失败时间戳。 */
 	lastFailedAt: number;
+	/** 最近一次错误 code（来自 ErrorDiagnostic.code）。 */
 	lastErrorCode?: string;
+	/** 最近一次错误 stage（来自 ErrorDiagnostic.stage）。 */
 	lastErrorStage?: string;
+	/** 最近一次错误 message（来自 ErrorDiagnostic.message）。 */
 	lastErrorMessage?: string;
 };
 
@@ -29,6 +43,17 @@ interface FailedTaskData {
 
 const CURRENT_VERSION = 1;
 
+/**
+ * FailedTaskManager - “可重试失败任务”的持久化管理器。
+ *
+ * 典型用法：
+ * - ReindexService 在捕获到“可重试错误”（网络中断、429 限流等）时调用 `markFailed(path, error)`
+ * - main.ts / 设置页在用户触发“重试失败项”时读取 `getAllPaths()` 并重新加入队列
+ *
+ * 设计要点：
+ * - 内存态用 Map，提高查询/更新效率
+ * - dirty 标记控制是否需要落盘，减少不必要 IO
+ */
 export class FailedTaskManager {
 	private tasks: Map<string, FailedTaskEntry> = new Map();
 	private dirty = false;
@@ -38,6 +63,13 @@ export class FailedTaskManager {
 		private taskPath: string,
 	) {}
 
+	/**
+	 * 从磁盘加载 failed-tasks.json。
+	 *
+	 * 兼容策略：
+	 * - 文件不存在：静默返回（表示当前没有失败项）
+	 * - JSON 损坏/结构不符：静默回退到空（不阻塞插件启动）
+	 */
 	async load(): Promise<void> {
 		this.tasks.clear();
 		this.dirty = false;
@@ -87,6 +119,11 @@ export class FailedTaskManager {
 		}
 	}
 
+	/**
+	 * 将当前失败任务写入磁盘（failed-tasks.json）。
+	 *
+	 * 只有 dirty 才会写入，避免频繁 IO。
+	 */
 	async save(): Promise<void> {
 		if (!this.dirty) {
 			return;
@@ -110,6 +147,11 @@ export class FailedTaskManager {
 		}
 	}
 
+	/**
+	 * 标记某个 path 的索引任务失败（并更新尝试次数/最后错误信息）。
+	 *
+	 * @returns 是否成功写入（path 为空会返回 false）。
+	 */
 	markFailed(path: string, error: unknown): boolean {
 		const normalized = path.trim();
 		if (!normalized) {
@@ -143,6 +185,10 @@ export class FailedTaskManager {
 		return true;
 	}
 
+	/**
+	 * 标记某个 path 已成功（或无需再重试），从失败列表中移除。
+	 * @returns 是否确实删除了一个条目。
+	 */
 	resolve(path: string): boolean {
 		const normalized = path.trim();
 		if (!normalized) {
@@ -156,6 +202,10 @@ export class FailedTaskManager {
 		return deleted;
 	}
 
+	/**
+	 * 处理 rename：把 oldPath 对应的失败记录迁移到 newPath。
+	 * @returns 是否迁移成功。
+	 */
 	rename(oldPath: string, newPath: string): boolean {
 		const oldKey = oldPath.trim();
 		const newKey = newPath.trim();
@@ -175,22 +225,25 @@ export class FailedTaskManager {
 		return true;
 	}
 
+	/** 获取所有失败文件路径（用于“重试失败项”）。 */
 	getAllPaths(): string[] {
 		return Array.from(this.tasks.keys());
 	}
 
+	/** 当前失败项数量。 */
 	get size(): number {
 		return this.tasks.size;
 	}
 
+	/** 是否存在未落盘的变更。 */
 	get isDirty(): boolean {
 		return this.dirty;
 	}
 
+	/** 清空所有失败项并落盘。 */
 	async clear(): Promise<void> {
 		this.tasks.clear();
 		this.dirty = true;
 		await this.save();
 	}
 }
-
