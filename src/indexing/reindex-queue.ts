@@ -73,6 +73,20 @@ export interface IndexTask {
 type TaskExecutor = (task: IndexTask) => Promise<void>;
 
 /**
+ * 批次级别的生命周期回调
+ *
+ * 每次 flush() 处理一批任务时触发：
+ * - onFlushStart：批次开始时，携带本次任务数量
+ * - onFlushEnd：批次结束时，携带成功/失败数量
+ *
+ * 用于 main.ts 驱动状态栏和完成 Notice。
+ */
+export type FlushCallbacks = {
+	onFlushStart?: (taskCount: number) => void;
+	onFlushEnd?: (succeeded: number, failed: number) => void;
+};
+
+/**
  * 防抖延迟（ms）
  *
  * 1000ms 是一个平衡点：
@@ -100,6 +114,9 @@ export class ReindexQueue {
 	/** 任务执行器（由外部通过 setExecutor 注入） */
 	private executor: TaskExecutor | null = null;
 
+	/** 批次回调（由外部通过 setFlushCallbacks 注入） */
+	private flushCallbacks: FlushCallbacks = {};
+
 	constructor(private debounceDelay: number = DEBOUNCE_DELAY) {}
 
 	/**
@@ -110,6 +127,15 @@ export class ReindexQueue {
 	 */
 	setExecutor(executor: TaskExecutor): void {
 		this.executor = executor;
+	}
+
+	/**
+	 * 注册批次生命周期回调
+	 *
+	 * 在 main.ts 的 createServices() 中调用，用于驱动状态栏和完成 Notice。
+	 */
+	setFlushCallbacks(callbacks: FlushCallbacks): void {
+		this.flushCallbacks = callbacks;
 	}
 
 	/**
@@ -211,25 +237,35 @@ export class ReindexQueue {
 
 		this.processing = true;
 
-		try {
-			// 快照：取出当前所有任务并清空队列
-			// 这样执行期间新入队的任务不会被本次 flush 处理，
-			// 而是等下一轮防抖后再处理
-			const tasks = Array.from(this.pending.values());
-			this.pending.clear();
+		// 快照：取出当前所有任务并清空队列
+		// 这样执行期间新入队的任务不会被本次 flush 处理，
+		// 而是等下一轮防抖后再处理
+		const tasks = Array.from(this.pending.values());
+		this.pending.clear();
 
+		this.flushCallbacks.onFlushStart?.(tasks.length);
+
+		let failedCount = 0;
+		try {
 			// 串行执行每个任务
 			for (const task of tasks) {
 				try {
 					await this.executor(task);
 				} catch (err) {
 					// 单个任务失败不阻塞其他任务
+					failedCount++;
 					console.error(`ReindexQueue: failed to process task [${task.type}] ${task.path}`, err);
 				}
 			}
 		} finally {
 			// 无论成功失败都要释放锁
 			this.processing = false;
+
+			try {
+				this.flushCallbacks.onFlushEnd?.(tasks.length - failedCount, failedCount);
+			} catch (err) {
+				console.error("ReindexQueue: onFlushEnd callback threw", err);
+			}
 
 			// 执行期间可能有新任务入队（如用户在索引过程中又编辑了文件），
 			// 需要再次启动防抖来处理这些新任务

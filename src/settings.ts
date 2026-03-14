@@ -129,9 +129,9 @@ export class SettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("监听文件变更（仅本地标记）")
+			.setName("自动增量索引")
 			.setDesc(
-				"开启后会监听笔记新增/修改/删除/重命名：新增/修改仅计算 Hash 并标记为待同步，不会自动调用 Embedding API。需要手动执行“同步变动笔记”或在关联视图点击“立即同步”才会消耗 API。",
+				"开启后会监听笔记新增/修改/删除/重命名，并自动对变更文件触发增量 Embedding（仅重新索引受影响的笔记，不会全量重建）。删除/重命名会立即处理；新增/修改在停止编辑约 1 秒后自动入队。",
 			)
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
@@ -152,12 +152,12 @@ export class SettingTab extends PluginSettingTab {
 
 					new Notice(
 						value
-							? "已开启变动标记：文件变更将被标记为待同步（不自动调用 API）。"
-							: "已关闭变动标记：文件变更不会自动标记，可手动执行“同步变动笔记”。",
+							? "已开启自动增量索引：文件变更将自动触发增量 Embedding。"
+							: "已关闭自动增量索引：文件变更不会自动处理，可手动执行\u201c同步变动笔记\u201d。",
 						6000,
-					);
-				}),
-			);
+				);
+			}),
+		);
 	}
 
 	/**
