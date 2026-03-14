@@ -612,8 +612,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					return;
 				}
 
-				if (!oldIsMd && newIsMd) {
-					// 新增 Markdown 文件不自动索引；由用户手动执行“同步变动笔记”。
+			if (!oldIsMd && newIsMd) {
+					// 非 md → md 的重命名视为新增，此处跳过；
+					// autoIndex=true 时会通过 create 事件触发 scheduleDirtyCheck 自动入队。
 					return;
 				}
 

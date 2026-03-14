@@ -261,7 +261,11 @@ export class ReindexQueue {
 			// 无论成功失败都要释放锁
 			this.processing = false;
 
-			this.flushCallbacks.onFlushEnd?.(tasks.length - failedCount, failedCount);
+			try {
+				this.flushCallbacks.onFlushEnd?.(tasks.length - failedCount, failedCount);
+			} catch (err) {
+				console.error("ReindexQueue: onFlushEnd callback threw", err);
+			}
 
 			// 执行期间可能有新任务入队（如用户在索引过程中又编辑了文件），
 			// 需要再次启动防抖来处理这些新任务
