@@ -17,10 +17,10 @@
 
 ### 1) 安装插件
 
-把插件文件放到你的 Vault 插件目录并启用：
+推荐：从 GitHub Releases 下载 `semantic-connections-vX.Y.Z.zip`，解压后把 `semantic-connections/` 文件夹放到你的 Vault 插件目录并启用：
 
-- 目标目录：`{vault}/.obsidian/plugins/semantic-connections/`
-- 需要的文件：
+- 目标目录：`{vault}/.obsidian/plugins/`
+- 文件夹内需要包含：
   - `main.js`
   - `manifest.json`
   - `styles.css`
@@ -146,4 +146,12 @@ npm run build
 - `dist/styles.css`
 
 将它们复制到你的 Vault：`{vault}/.obsidian/plugins/semantic-connections/` 后重启 Obsidian 或重载插件即可。
+
+## 发布（Release）
+
+1. 更新 `manifest.json` 的 `version` 为 `X.Y.Z`
+2. 创建并推送 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`
+3. GitHub Actions 会自动构建并在 Releases 上传：
+   - `main.js` / `manifest.json` / `styles.css`
+   - `semantic-connections-vX.Y.Z.zip`
 
