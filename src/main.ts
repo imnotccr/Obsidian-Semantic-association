@@ -105,6 +105,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	private indexVersionValue = 0;
 
 	private dirtyCheckTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	private indexingStatusBar: HTMLElement | null = null;
 
 	get indexVersion(): number {
 		return this.indexVersionValue;
@@ -164,6 +165,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new SettingTab(this.app, this));
+
+		this.indexingStatusBar = this.addStatusBarItem();
+		this.indexingStatusBar.hide();
 
 		this.app.workspace.onLayoutReady(() => {
 			void this.onLayoutReady().catch((error) => {
@@ -464,6 +468,14 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				this.scheduleIndexSave();
 			}
 		});
+		this.reindexQueue.setFlushCallbacks({
+			onFlushStart: (taskCount) => {
+				this.setIndexingStatus(true, taskCount);
+			},
+			onFlushEnd: (succeeded, failed) => {
+				this.setIndexingStatus(false, succeeded, failed);
+			},
+		});
 
 		this.connectionsService = new ConnectionsService(
 			this.noteStore,
@@ -530,6 +542,10 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			}
 		} else {
 			await this.maybeNotifyWeeklyRebuildReminder();
+			// 快照加载成功后，若开启了自动索引，静默入队启动时的新增/待同步文件
+			if (this.settings.autoIndex) {
+				void this.enqueueStartupDirtyFiles();
+			}
 		}
 
 		await this.logRuntimeEvent("plugin-ready", "插件启动完成。", {
@@ -651,6 +667,67 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		this.dirtyCheckTimers.set(path, timer);
 	}
 
+	/**
+	 * 更新状态栏中的索引进度指示器，并在完成时发出 Notice。
+	 *
+	 * @param active   true = 索引正在进行；false = 本批次已完成
+	 * @param count    active=true 时为本批次任务数；active=false 时为成功数
+	 * @param failed   active=false 时的失败数（默认 0）
+	 */
+	private setIndexingStatus(active: boolean, count = 0, failed = 0): void {
+		if (!this.indexingStatusBar) return;
+
+		if (active) {
+			this.indexingStatusBar.setText(`↻ 正在索引... (${count} 篇)`);
+			this.indexingStatusBar.show();
+		} else {
+			// 若队列中仍有后续任务，保持状态栏可见（下一批 onFlushStart 会更新文字）
+			if (this.reindexQueue.pendingCount > 0) return;
+
+			this.indexingStatusBar.hide();
+
+			if (failed > 0) {
+				new Notice(`索引完成：${count} 篇成功，${failed} 篇失败。`, 5000);
+			} else if (count > 0) {
+				new Notice(`已更新 ${count} 篇笔记的索引。`, 3000);
+			}
+		}
+	}
+
+	/**
+	 * 启动时静默入队待处理文件（增量索引）
+	 *
+	 * 在 onLayoutReady 中，快照加载成功且 autoIndex=true 时调用。
+	 * 扫描 vault 中所有未排除的 .md 文件，将以下两类入队：
+	 * - 不在 noteStore 的文件（插件未启动期间新增的笔记）
+	 * - noteStore 中已标记 dirty/outdated 的文件
+	 *
+	 * 不读取文件内容做 hash 比对（避免启动时大量 I/O），
+	 * 实际的 hash 二次确认由 indexFile() 内部完成。
+	 */
+	private async enqueueStartupDirtyFiles(): Promise<void> {
+		if (!this.settings.remoteBaseUrl.trim() || !this.settings.remoteApiKey.trim()) {
+			// 远程配置不完整时跳过（请求也会立即失败，无意义入队）
+			return;
+		}
+		const files = this.scanner.getMarkdownFiles(this.settings.excludedFolders);
+		let queued = 0;
+		for (const file of files) {
+			const existing = this.noteStore.get(file.path);
+			if (!existing || existing.dirty || existing.outdated) {
+				this.reindexQueue.enqueue({ type: "modify", path: file.path });
+				queued++;
+			}
+		}
+		if (queued > 0) {
+			await this.logRuntimeEvent(
+				"startup-incremental-queue",
+				`启动时自动入队 ${queued} 个新增或待同步笔记。`,
+				{ category: "lifecycle" },
+			);
+		}
+	}
+
 	private async reconcileDirtyFlagForPath(path: string): Promise<void> {
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile) || file.extension !== "md") {
@@ -662,21 +739,23 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		const existing = this.noteStore.get(file.path);
 		if (!existing) {
+			// 新文件（noteStore 中没有记录）→ 直接入队增量索引
+			this.reindexQueue.enqueue({ type: "modify", path: file.path });
 			return;
 		}
 
 		const content = await this.app.vault.cachedRead(file);
 		const hash = hashContent(content);
 		const isOutdated = existing.hash !== hash;
-		const isMarkedDirty = existing.dirty || existing.outdated;
 
-		if (isOutdated && !isMarkedDirty) {
-			this.noteStore.set({ ...existing, dirty: true, outdated: true });
-			this.scheduleIndexSave();
+		if (isOutdated) {
+			// 内容已变更 → 直接入队重新 embed（indexFile 内部仍会做 hash 二次确认）
+			this.reindexQueue.enqueue({ type: "modify", path: file.path });
 			return;
 		}
 
-		if (!isOutdated && isMarkedDirty) {
+		// 内容未变但有脏标记（如之前标记后内容被回滚）→ 清除标记
+		if (existing.dirty || existing.outdated) {
 			this.noteStore.set({ ...existing, dirty: undefined, outdated: undefined });
 			this.scheduleIndexSave();
 		}
