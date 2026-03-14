@@ -1,9 +1,0 @@
-{
-	"id": "semantic-connections",
-	"name": "语义关联",
-	"version": "0.1.0",
-	"minAppVersion": "1.0.0",
-	"description": "为库中的笔记建立语义索引，展示相关笔记及最契合的段落",
-	"author": "",
-	"isDesktopOnly": true
-}
