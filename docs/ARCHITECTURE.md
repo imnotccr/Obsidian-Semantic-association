@@ -12,7 +12,7 @@
 ### UI（视图 / 命令 / 设置）
 
 - `src/views/connections-view.ts`
-- `src/views/lookup-view.ts`
+- `src/views/lookup-view.ts`（语义搜索待办界面，当前不作为正式支持范围）
 - `src/settings.ts`
 
 该层负责渲染视图、注册命令与设置项，本身不实现索引或检索算法。
@@ -51,8 +51,10 @@
 ### Search（检索）
 
 - `src/search/connections-service.ts`
-- `src/search/lookup-service.ts`
+- `src/search/lookup-service.ts`（语义搜索待办链路）
 - `src/search/passage-selector.ts`
+
+说明：当前正式维护和对外文档承诺的检索能力以“关联视图”为主。`lookup-view.ts` / `lookup-service.ts` 相关的自然语言查询能力暂列待办，不纳入当前阶段的稳定交付范围。
 
 ## Chunk 切分策略（Chunking Strategy）
 

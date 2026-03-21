@@ -88,7 +88,7 @@ export class SettingTab extends PluginSettingTab {
 					}),
 			);
 
-		// 3) 行为设置：自动打开视图、是否监听文件变化（仅标记 dirty，不会自动请求 API）
+		// 3) 行为设置：自动打开视图、是否在笔记变更时自动更新索引
 		this.renderBehaviorSettings(containerEl);
 		// 4) 关联视图相关：展示数量、阈值、每篇最多展示多少段落等
 		this.renderConnectionsSettings(containerEl);
@@ -101,7 +101,7 @@ export class SettingTab extends PluginSettingTab {
 	 *
 	 * 这里的设置会影响插件在后台做什么：
 	 * - `autoOpenConnectionsView`：启动后自动打开关联视图（不抢焦点）
-	 * - `autoIndex`：监听 vault 文件变动；注意这里只是标记 dirty/outdated，不会自动调用远程 embeddings
+	 * - `autoIndex`：在笔记变更时，仅对受影响的笔记自动更新索引
 	 */
 	private renderBehaviorSettings(containerEl: HTMLElement): void {
 		containerEl.createEl("h3", { text: "行为" });
@@ -129,9 +129,9 @@ export class SettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("自动增量索引")
+			.setName("笔记变更时自动更新索引")
 			.setDesc(
-				"开启后会监听笔记新增/修改/删除/重命名，并自动对变更文件触发增量 Embedding（仅重新索引受影响的笔记，不会全量重建）。删除/重命名会立即处理；新增/修改在停止编辑约 1 秒后自动入队。",
+				"开启后，新建、修改、删除或重命名笔记时，插件会自动更新受影响笔记的索引，不会全量重建。删除/重命名会立即处理；新增/修改会在停止编辑约 1 秒后自动更新。",
 			)
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
@@ -152,8 +152,8 @@ export class SettingTab extends PluginSettingTab {
 
 					new Notice(
 						value
-							? "已开启自动增量索引：文件变更将自动触发增量 Embedding。"
-							: "已关闭自动增量索引：文件变更不会自动处理，可手动执行\u201c同步变动笔记\u201d。",
+							? "已开启：笔记变更时会自动更新受影响笔记的索引。"
+							: "已关闭：笔记变更不会自动更新索引，可手动执行\u201c同步变动笔记\u201d。",
 						6000,
 				);
 			}),
@@ -164,7 +164,7 @@ export class SettingTab extends PluginSettingTab {
 	 * 渲染“远程嵌入（Remote Embeddings）”设置 section。
 	 *
 	 * 该 section 控制 `EmbeddingService` 的 remote provider：
-	 * - base URL：会被 `normalizeRemoteBaseUrl()` 归一化，最终请求 `{baseUrl}/v1/embeddings`
+	 * - base URL：用户只需填写服务根地址；会被 `normalizeRemoteBaseUrl()` 归一化，最终请求 `{baseUrl}/v1/embeddings`
 	 * - API key：以 `Authorization: Bearer <key>` 形式发送
 	 * - model/timeout/batch size：控制请求参数
 	 *
@@ -175,7 +175,9 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("API 基础 URL")
-			.setDesc("请求将发送到 {baseUrl}/v1/embeddings。")
+			.setDesc(
+				"只需填写服务根地址（例如 https://api.example.com）；无需手动填写 /v1 或 /v1/embeddings，插件会自动补齐。",
+			)
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteBaseUrl;
@@ -475,6 +477,10 @@ export class SettingTab extends PluginSettingTab {
 		const commitThreshold = async (raw: number): Promise<void> => {
 			const previousValue = this.plugin.settings.minSimilarityScore;
 			const nextValue = Math.max(0, Math.min(1, raw));
+			if (nextValue === previousValue) {
+				syncThresholdControls(previousValue);
+				return;
+			}
 			this.plugin.settings.minSimilarityScore = nextValue;
 
 			const saved = await this.saveSettingsOrRollback(
@@ -491,6 +497,7 @@ export class SettingTab extends PluginSettingTab {
 			}
 
 			syncThresholdControls(this.plugin.settings.minSimilarityScore);
+			await this.plugin.refreshConnectionsViews(true);
 		};
 
 		new Setting(containerEl)
@@ -513,7 +520,7 @@ export class SettingTab extends PluginSettingTab {
 				const commit = async (): Promise<void> => {
 					const nextValue = this.parseNumberInRangeInput(
 						text.getValue(),
-						DEFAULT_SETTINGS.minSimilarityScore,
+						this.plugin.settings.minSimilarityScore,
 						0,
 						1,
 					);

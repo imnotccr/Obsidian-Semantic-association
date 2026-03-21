@@ -18,9 +18,9 @@
  * 4) `ConnectionsView` / `LookupView`：通过 `ConnectionsService` / `LookupService` 查询向量相似度并展示结果
  *
  * 设计取舍：
- * - 本插件默认不会在后台“悄悄”调用远程 embeddings API。
- *   `autoIndex` 只会把笔记标记为“可能过期”，需要你手动执行“同步变动笔记”或“重建索引”才会真正请求 API，
- *   这样可以避免无意的 token / 费用消耗。
+ * - 本插件默认不会自动做“全量重建”；首次建索引与重要配置变更后的重建仍需用户手动触发。
+ * - `autoIndex` 默认关闭；开启后会在后台对新增/修改/删除/重命名的笔记执行增量索引，
+ *   只处理受影响的笔记，而不是整库重建。
  */
 
 import { MarkdownView, Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
@@ -427,6 +427,19 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		}
 	}
 
+	/** 设置变更后，主动刷新已打开的关联视图。 */
+	async refreshConnectionsViews(force = false): Promise<void> {
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CONNECTIONS);
+		await Promise.allSettled(
+			leaves.map(async (leaf) => {
+				const view = leaf.view;
+				if (view instanceof ConnectionsView) {
+					await view.refreshNow(force);
+				}
+			}),
+		);
+	}
+
 	/** 清空当前内存中的索引数据（不会自动重建，需要用户手动触发）。 */
 	clearIndexData(): void {
 		this.noteStore.clear();
@@ -675,7 +688,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	 * workspace layout ready 后的启动序列：
 	 * - 载入并清理日志文件
 	 * - 尝试从磁盘恢复索引快照
-	 * - 注册 vault 文件事件（可选的“变动标记”）
+	 * - 注册 vault 文件事件（可选的自动增量索引）
 	 * - 根据设置自动打开视图、提示是否需要手动重建索引
 	 */
 	private async onLayoutReady(): Promise<void> {
@@ -742,10 +755,12 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	}
 
 	/**
-	 * 注册 vault 文件事件，用于在用户编辑笔记时做“增量索引”的输入准备。
+	 * 注册 vault 文件事件，用于在用户编辑笔记时做自动增量索引。
 	 *
-	 * 重要：当 `autoIndex=true` 时，本插件仍然不会自动请求 embeddings API；
-	 * 它只会通过 hash 比较把笔记标记为 dirty/outdated（需要用户手动同步）。
+	 * 当 `autoIndex=true` 时：
+	 * - create/modify 会经过 debounce + hash 校验后自动入队增量索引
+	 * - delete/rename 会自动更新或清理索引
+	 * - 仍然不会触发“全量重建”；只有受影响笔记会被处理
 	 */
 	private registerFileEvents(): void {
 		this.registerEvent(

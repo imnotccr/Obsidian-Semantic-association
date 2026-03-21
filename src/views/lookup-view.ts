@@ -10,7 +10,7 @@
  * - 输入事件做 debounce（避免每敲一次键就请求 embeddings API）
  * - `searchRequestId` 解决竞态：新的搜索开始后，旧请求结果会被丢弃
  */
-import { ItemView, WorkspaceLeaf } from "obsidian";
+import { Component, ItemView, MarkdownRenderer, WorkspaceLeaf } from "obsidian";
 import type SemanticConnectionsPlugin from "../main";
 import type { LookupResult } from "../types";
 import { debounce, type DebouncedFn } from "../utils/debounce";
@@ -35,6 +35,8 @@ export class LookupView extends ItemView {
 	private resultsContainer: HTMLElement | null = null;
 	/** 每次搜索递增，用于丢弃过期请求的结果（防竞态）。 */
 	private searchRequestId = 0;
+	/** 搜索结果预览渲染时创建的子组件，刷新时统一卸载避免泄漏。 */
+	private previewRenderChildren: Component[] = [];
 	/** 防抖后的 input handler：便于 onClose 时 cancel 定时器，避免 view 关闭后仍触发搜索。 */
 	private debouncedSearch: DebouncedFn<(event: Event) => void> | null = null;
 
@@ -95,6 +97,7 @@ export class LookupView extends ItemView {
 	async onClose(): Promise<void> {
 		this.debouncedSearch?.cancel();
 		this.debouncedSearch = null;
+		this.clearPreviewRenderChildren();
 		this.searchInput = null;
 		this.resultsContainer = null;
 		this.searchRequestId++;
@@ -173,6 +176,7 @@ export class LookupView extends ItemView {
 		if (!this.resultsContainer) {
 			return;
 		}
+		this.clearPreviewRenderChildren();
 		this.resultsContainer.empty();
 		this.resultsContainer
 			.createEl("div", { cls: "sc-placeholder" })
@@ -184,12 +188,20 @@ export class LookupView extends ItemView {
 		if (!this.resultsContainer) {
 			return;
 		}
+		this.clearPreviewRenderChildren();
 		this.resultsContainer.empty();
 
 		const list = this.resultsContainer.createEl("div", { cls: "sc-results-list" });
 		for (const result of results) {
-			this.renderResultItem(list, result);
+			void this.renderResultItem(list, result);
 		}
+	}
+
+	private clearPreviewRenderChildren(): void {
+		for (const child of this.previewRenderChildren) {
+			child.unload();
+		}
+		this.previewRenderChildren = [];
 	}
 
 	/**
@@ -197,7 +209,7 @@ export class LookupView extends ItemView {
 	 *
 	 * 点击标题/段落会打开目标笔记，并高亮命中 chunk 对应的行范围（ChunkMeta.range）。
 	 */
-	private renderResultItem(parent: Element, result: LookupResult): void {
+	private async renderResultItem(parent: Element, result: LookupResult): Promise<void> {
 		const item = parent.createEl("div", { cls: "sc-result-item" });
 
 		const header = item.createEl("div", { cls: "sc-result-header" });
@@ -235,15 +247,42 @@ export class LookupView extends ItemView {
 				});
 			}
 
-			const previewText =
-				result.passage.text.length > 200
-					? result.passage.text.slice(0, 200) + "..."
-					: result.passage.text;
-
-			passageEl.createEl("div", {
-				text: previewText,
-				cls: "sc-passage-text",
+			const previewEl = passageEl.createEl("div", {
+				cls: "sc-passage-text sc-passage-markdown markdown-rendered",
 			});
+			await this.renderMarkdownPreview(previewEl, result.passage.text, result.notePath);
 		}
+	}
+
+	private async renderMarkdownPreview(
+		container: HTMLElement,
+		markdown: string,
+		sourcePath: string,
+	): Promise<void> {
+		const text = markdown.trim();
+		if (!text) {
+			container.empty();
+			container.setText("（空片段）");
+			container.addClass("is-fallback");
+			return;
+		}
+
+		const renderChild = new Component();
+		this.addChild(renderChild);
+		this.previewRenderChildren.push(renderChild);
+
+		try {
+			await MarkdownRenderer.render(this.app, text, container, sourcePath, renderChild);
+		} catch {
+			container.empty();
+			container.setText(this.createFallbackPreviewText(text));
+			container.addClass("is-fallback");
+		}
+	}
+
+	private createFallbackPreviewText(markdown: string): string {
+		const compact = markdown.replace(/\n{3,}/g, "\n\n").trim();
+		const previewLimit = 320;
+		return compact.length > previewLimit ? `${compact.slice(0, previewLimit)}...` : compact;
 	}
 }

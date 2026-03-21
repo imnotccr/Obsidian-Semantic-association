@@ -14,7 +14,7 @@
  * 一致性处理：
  * - 使用 `refreshRequestId` 丢弃过期请求，避免异步查询结果乱序覆盖 UI。
  */
-import { ItemView, MarkdownView, TFile, WorkspaceLeaf } from "obsidian";
+import { Component, ItemView, MarkdownRenderer, MarkdownView, TFile, WorkspaceLeaf } from "obsidian";
 import type SemanticConnectionsPlugin from "../main";
 import type { ConnectionResult } from "../types";
 import { debounce } from "../utils/debounce";
@@ -39,6 +39,8 @@ export class ConnectionsView extends ItemView {
 	private currentIndexVersion = -1;
 	/** 每次 refreshView 都会递增，用于丢弃过期请求的结果（防竞态）。 */
 	private refreshRequestId = 0;
+	/** 关联结果预览渲染时创建的子组件，刷新时统一卸载避免泄漏。 */
+	private previewRenderChildren: Component[] = [];
 	/** 对高频事件（如 modify）做 debounce，避免 UI 抖动与重复查询。 */
 	private scheduleRefresh = debounce((force: boolean = false) => {
 		void this.refreshView(force);
@@ -98,6 +100,7 @@ export class ConnectionsView extends ItemView {
 	 */
 	async onClose(): Promise<void> {
 		this.scheduleRefresh.cancel();
+		this.clearPreviewRenderChildren();
 		this.currentNotePath = "";
 		this.lastMarkdownFile = null;
 		this.currentIndexVersion = -1;
@@ -110,6 +113,11 @@ export class ConnectionsView extends ItemView {
 	 */
 	onIndexVersionChanged(_version: number, _reason: string): void {
 		void this.refreshView();
+	}
+
+	/** 供外部在设置变更后主动触发刷新。 */
+	async refreshNow(force = false): Promise<void> {
+		await this.refreshView(force);
 	}
 
 	/**
@@ -170,7 +178,7 @@ export class ConnectionsView extends ItemView {
 					file,
 				);
 			} else {
-				this.renderResults(results, file);
+				await this.renderResults(results, file);
 			}
 		} catch (err) {
 			if (this.isStaleRequest(requestId, file.path)) {
@@ -249,13 +257,11 @@ export class ConnectionsView extends ItemView {
 	}
 
 	/** 渲染关联结果列表。 */
-	private renderResults(results: ConnectionResult[], file: TFile): void {
+	private async renderResults(results: ConnectionResult[], file: TFile): Promise<void> {
 		const container = this.prepareContainer(file);
 
 		const list = container.createEl("div", { cls: "sc-results-list" });
-		for (const result of results) {
-			this.renderResultItem(list, result);
-		}
+		await Promise.all(results.map((result) => this.renderResultItem(list, result)));
 	}
 
 	/**
@@ -263,6 +269,7 @@ export class ConnectionsView extends ItemView {
 	 */
 	private prepareContainer(file: TFile | null): HTMLElement {
 		const container = this.contentEl;
+		this.clearPreviewRenderChildren();
 		container.empty();
 
 		if (file) {
@@ -273,6 +280,13 @@ export class ConnectionsView extends ItemView {
 		}
 
 		return container;
+	}
+
+	private clearPreviewRenderChildren(): void {
+		for (const child of this.previewRenderChildren) {
+			child.unload();
+		}
+		this.previewRenderChildren = [];
 	}
 
 	/**
@@ -340,7 +354,7 @@ export class ConnectionsView extends ItemView {
 	 * - 点击标题/片段：打开目标笔记，并高亮 bestPassage 对应的行范围
 	 * - tooltip：展示阈值、原始分数、聚合分数等调试信息
 	 */
-	private renderResultItem(parent: Element, result: ConnectionResult): void {
+	private async renderResultItem(parent: Element, result: ConnectionResult): Promise<void> {
 		const item = parent.createEl("div", { cls: "sc-result-item" });
 
 		const header = item.createEl("div", { cls: "sc-result-header" });
@@ -397,21 +411,47 @@ export class ConnectionsView extends ItemView {
 			});
 		}
 
-		const previewLimit = 260;
-		const previewText =
-			snippetText.length > previewLimit
-				? snippetText.slice(0, previewLimit) + "..."
-				: snippetText;
-
-		snippetEl.createEl("div", {
-			text: previewText,
-			cls: "sc-passage-text",
+		const previewEl = snippetEl.createEl("div", {
+			cls: "sc-passage-text sc-passage-markdown markdown-rendered",
 		});
+		await this.renderMarkdownPreview(previewEl, snippetText, result.notePath);
 
 		const pathEl = item.createEl("div", {
 			text: result.notePath,
 			cls: "sc-result-path",
 		});
 		pathEl.setAttr("title", result.notePath);
+	}
+
+	private async renderMarkdownPreview(
+		container: HTMLElement,
+		markdown: string,
+		sourcePath: string,
+	): Promise<void> {
+		const text = markdown.trim();
+		if (!text) {
+			container.empty();
+			container.setText("（空片段）");
+			container.addClass("is-fallback");
+			return;
+		}
+
+		const renderChild = new Component();
+		this.addChild(renderChild);
+		this.previewRenderChildren.push(renderChild);
+
+		try {
+			await MarkdownRenderer.render(this.app, text, container, sourcePath, renderChild);
+		} catch {
+			container.empty();
+			container.setText(this.createFallbackPreviewText(text));
+			container.addClass("is-fallback");
+		}
+	}
+
+	private createFallbackPreviewText(markdown: string): string {
+		const compact = markdown.replace(/\n{3,}/g, "\n\n").trim();
+		const previewLimit = 320;
+		return compact.length > previewLimit ? `${compact.slice(0, previewLimit)}...` : compact;
 	}
 }

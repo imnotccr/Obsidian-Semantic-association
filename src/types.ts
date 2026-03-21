@@ -81,10 +81,10 @@ export interface NoteMeta {
 	/** 内容 hash：用于判断是否变动（是否需要重新索引） */
 	hash: string;
 	/**
-	 * 内容已变更但尚未重新索引（仅本地标记，不触发自动 embedding）。
+	 * 内容已变更但尚未重新索引。
 	 * dirty/outdated 语义等价：outdated 为兼容字段。
 	 */
-	/** 标记：笔记内容已变更但尚未重新索引（仅本地标记，不会自动触发 embedding 请求）。 */
+	/** 标记：笔记内容已变更但尚未重新索引。 */
 	dirty?: boolean;
 	/** 兼容字段：与 dirty 语义等价（旧版本字段名）。 */
 	outdated?: boolean;
@@ -199,7 +199,7 @@ export interface SemanticConnectionsSettings {
 	excludedFolders: string[];
 	/** 当前只支持 remote provider（请求外部 embeddings 服务）。 */
 	embeddingProvider: "remote";
-	/** 是否监听文件变动（仅标记 dirty，不会自动调用 embeddings）。 */
+	/** 是否监听文件变动，并自动对受影响笔记执行增量索引。 */
 	autoIndex: boolean;
 	/** 启动后是否自动打开关联视图（右侧栏）。 */
 	autoOpenConnectionsView: boolean;

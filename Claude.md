@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-这是一个 Obsidian 语义索引插件。
+这是一个 Obsidian 语义索引插件。当前阶段优先维护关联视图、索引管理与变更同步；语义搜索相关链路暂列待办。
 
 历史上 embedding 方案有两种（remote/local），当前仅支持：
 
@@ -56,7 +56,7 @@ flowchart TB
   O --> P[运行/索引异常]
   P --> Q[写入 error-log.json / runtime-log.json]
 
-  E --> R[Connections/Lookup 查询]
+  E --> R[Connections 查询（当前）\nLookup / 语义搜索（待办）]
   R --> S[ConnectionsService + PassageSelector\n选择最强关联片段]
 ```
 
@@ -103,14 +103,14 @@ flowchart TB
   - note/chunk/vector store
 
 - `src/search/`
-  - 关联推荐与语义搜索
+  - 当前重点是关联推荐；语义搜索暂列待办
   - `ConnectionsService`：
     - 先做 chunk-level 召回得到候选笔记
     - 再用 `PassageSelector` 在候选笔记内找出「最强关联片段」（用于 UI 与排序）
     - 仍保留 `passageScore`（log-sum-exp 聚合）用于透明化解释
   - `LookupService`：
-    - 对 query 做一次 embedding
-    - 在 chunk 向量中检索并返回每篇笔记的最佳 chunk
+    - 相关代码路径仍保留，作为后续语义搜索待办
+    - 若后续恢复推进，预期流程仍是「query embedding → chunk 检索 → 按笔记聚合最佳 chunk」
 
 - `tsconfig.json`
   - TypeScript 的类型检查/编辑器配置文件
